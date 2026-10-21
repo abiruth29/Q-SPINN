@@ -1,3 +1,5 @@
+> **SUPERSEDED (pre-v3.1).** Mathematical exposition only; every result table, compute-saving figure, crash-probability and BTC lead-lag statement below is retracted. See README.md and docs/FIX_PLAN.md.
+
 # Q-SPINN: Quantum-Inspired Spiking Physics-Informed Neural Network
 ## Complete Architectural Reference, Mathematical Framework & Empirical Publication Results
 

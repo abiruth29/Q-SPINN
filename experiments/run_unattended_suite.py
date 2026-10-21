@@ -154,19 +154,20 @@ def generate_master_report(state: dict):
         bm = binance_job["metrics"]
         binance_row = f"| **Q-SPINN Multi-Asset** | {bm['acc']:.3f} | {bm['f1']:.3f} | {bm['gate']:.3f} | ✅ Trained |\n"
         binance_lead_lag = f"""
-### Empirical Lead-Lag Discovery (Objective O2)
-- **BTC $\\to$ ETH Phase Flux ($\\Phi_{{0,1}}$):** `{bm['btc_eth_lead']:+.4f}` rad
-- **BTC $\\to$ SOL Phase Flux ($\\Phi_{{0,2}}$):** `{bm['btc_sol_lead']:+.4f}` rad
-- **Empirical Interpretation:** Positive phase angle demonstrates that BTC microstructure movements dynamically precede altcoin order flow, validating the continuous-time Magnetic Graph Laplacian on decentralized assets.
+### Phase-matrix diagnostic (no lead-lag claim)
+- **BTC-ETH-SOL loop flux (gauge-invariant):** `{bm.get('loop_flux', float('nan')):+.4f}` rad
+- Individual edge phases are gauge-dependent and are not reported. A lead-lag statement requires an out-of-sample predictive
+  increment over directional temporal baselines, which this run does not test.
 """
     else:
         binance_row = "| **Q-SPINN Multi-Asset** | Pending | — | — | — |\n"
 
     now = datetime.now().isoformat()
+    hw = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
     md = f"""# Q-SPINN — Master Publication Experimental Results
 
 **Last Updated:** {now}  
-**Hardware:** NVIDIA GeForce RTX 3060 Laptop GPU  
+**Hardware:** {hw}  
 **Execution Mode:** Unattended Automated Experimental Suite  
 
 ---
@@ -203,11 +204,12 @@ Validates cross-asset Magnetic Graph Laplacian coupling on Binance microstructur
 {binance_lead_lag}
 ---
 
-## 4. Key Quantitative Confirmations
+## 4. How to read these tables
 
-1. **Gate Sparsity & Compute Efficiency:** Dense PINN compute is activated only on ~5–10% of ticks, delivering up to a 90–95% compute reduction in production.
-2. **Phase-Space EWS Stability:** The Numerical Abscissa $\\omega(A_t)$ strictly maintains contractive bounds ($\\le 0$) during normal markets, transitioning to positive values solely during true volatility shocks.
-3. **Exact Complex Propagation:** Exact Van Loan continuous-to-discrete covariance integration achieves machine-precision Hermiticity (‖H−H†‖ = 0.00e+00).
+1. The gate rate is a routing-budget statistic, not a compute saving; use the measured latency in `routing_study_k*_s*.json`.
+2. $\\omega(A_t)$ is a latent-flow diagnostic; whether it forecasts instability is decided only by `early_warning_k*_s*.json`.
+3. $\\|H-H^\\dagger\\|=0$ because $H$ is constructed Hermitian; it is a code check, not a result.
+4. Every number here was produced under protocol `{PROTOCOL_VERSION}`; results from other protocols are ignored.
 """
     MASTER_MD.write_text(md, encoding="utf-8")
     log(f"Master publication report updated → {MASTER_MD}")
