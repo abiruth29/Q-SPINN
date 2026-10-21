@@ -183,7 +183,7 @@ class HamiltonianNet(nn.Module):
         self.log_R = nn.Parameter(torch.full((n_assets,), -2.0))
         self.scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, velocities):
+    def forward(self, velocities, with_prefix=False):
         B, seq_len, _ = velocities.shape
         import torch.nn.functional as F
         
@@ -201,11 +201,13 @@ class HamiltonianNet(nn.Module):
             mu_raw = out[:, :self.n_assets * 3 * self.d * self.d]
             mu_t  = mu_raw.view(B, self.n_assets, 3, self.d, self.d)
             
-            if t == seq_len - 1:
+            if t >= seq_len - 2:          # last two steps: keep graph heads for the prefix and full generators
                 idx_A = self.n_assets * 3 * self.d * self.d
                 idx_Phi = idx_A + self.n_assets * self.n_assets
-                A_raw   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
-                Phi_raw = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
+                A_t   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
+                Phi_t = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
+                if t == seq_len - 2: A_pre, Phi_pre = A_t, Phi_t
+                if t == seq_len - 1: A_raw, Phi_raw = A_t, Phi_t
             
             if z_t is None:
                 z_t = mu_t
@@ -216,7 +218,20 @@ class HamiltonianNet(nn.Module):
                 K_t = P_pred / (P_pred + R)
                 z_t = z_pred + K_t * (mu_t - z_pred)
                 P_t = (1 - K_t) * P_pred
+            if t == seq_len - 2:          # filtered state using observations up to (and incl.) step T-2 only
+                z_pre, P_pre = z_t, P_t
         
+        full = self._assemble(z_t, P_t, A_raw, Phi_raw, B, velocities.device)
+        if not with_prefix:
+            return full
+        if seq_len >= 2:
+            return full, self._assemble(z_pre, P_pre, A_pre, Phi_pre, B, velocities.device)
+        zero = tuple(torch.zeros_like(t_) if torch.is_tensor(t_) else t_ for t_ in full)
+        return full, zero      # 1 velocity step: no causal prefix -> identity residual generator
+
+
+    def _assemble(self, z_t, P_t, A_raw, Phi_raw, B, device):
+        import torch.nn.functional as F
         if self.training:
             epsilon = torch.randn_like(z_t)
             std = torch.sqrt(P_t + 1e-6)
@@ -243,9 +258,9 @@ class HamiltonianNet(nn.Module):
             L = torch.complex(D, torch.zeros_like(D)) - W
             
             # Kronecker coupling: H_tot = BlockDiag(H_k) + L (x) I_d
-            H_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.complex64, device=velocities.device)
-            S_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.float32, device=velocities.device)
-            I_d = torch.eye(self.d, dtype=torch.complex64, device=velocities.device)
+            H_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.complex64, device=device)
+            S_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.float32, device=device)
+            I_d = torch.eye(self.d, dtype=torch.complex64, device=device)
             
             for i in range(self.n_assets):
                 for j in range(self.n_assets):
@@ -351,7 +366,7 @@ class QSPINN(nn.Module):
     def heavy_path(self, x):
         # Pass the entire sequence of velocities to the Kalman Filter
         velocities = x[:, 1:] - x[:, :-1]
-        H_tot, S_tot = self.ham(velocities)
+        (H_tot, S_tot), (H_res, S_res) = self.ham(velocities, with_prefix=True)   # prefix ends at T-2: causal residual
         
         B, N, _ = H_tot.shape
         
@@ -374,7 +389,7 @@ class QSPINN(nn.Module):
 
         # Task 09/10: ONE generator A = S - iH drives the means; residuals are causal ('last').
         psi = self.amp(x)     # unnormalised dynamical state
-        U, L_pde, L_norm_ = propagate(psi, H_tot, S_tot, DT, RESIDUAL_MODE)
+        U, L_pde, L_norm_ = propagate(psi, H_tot, S_tot, DT, RESIDUAL_MODE, H_res=H_res, S_res=S_res)
 
         if self.use_cov:
             z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
@@ -395,6 +410,35 @@ class QSPINN(nn.Module):
             ComplexAmplitudeLayer.density_features(psi_next)], dim=-1)
             
         return self.head(feats), L_pde, H_tot, S_tot, L_cov, L_norm
+
+    @torch.no_grad()
+    def heavy_infer(self, x):
+        """Inference-only heavy expert: logits only - no residual generator, no PDE/norm/covariance work."""
+        (H_tot, S_tot) = self.ham(x[:, 1:] - x[:, :-1])
+        psi = self.amp(x)
+        U = torch.matrix_exp((S_tot.to(torch.complex64) - 1j * H_tot) * DT)
+        psi_T = ComplexAmplitudeLayer.normalise(psi[:, -1])
+        psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))
+        feats = torch.cat([ComplexAmplitudeLayer.density_features(psi_T),
+                           ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),
+                           ComplexAmplitudeLayer.density_features(psi_next)], dim=-1)
+        return self.head(feats)
+
+    @torch.no_grad()
+    def infer(self, spikes, x, dt_seq, chunk=4096):
+        """
+        Deployed conditional inference: gate first, heavy expert ONLY on selected rows, scatter back.
+        Returns (logits, selected_mask, heavy_rows).  Zero selected rows => zero heavy calls.
+        """
+        self.eval()
+        cheap, g, _, _ = self.gate(spikes, dt_seq)
+        sel = g > 0.5
+        out = cheap.clone()
+        idx = torch.nonzero(sel, as_tuple=False).squeeze(1)
+        for i in range(0, len(idx), chunk):
+            j = idx[i:i + chunk]
+            out[j] = self.heavy_infer(x[j])
+        return out, sel, int(len(idx))
 
     def forward(self, spikes, x, dt_seq, mode="learned"):
         cheap, g, rate, gl = self.gate(spikes, dt_seq)

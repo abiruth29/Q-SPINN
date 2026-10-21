@@ -263,14 +263,17 @@ def symmetric_from_raw(s_raw: torch.Tensor) -> torch.Tensor:
 
 
 def propagate(psi: torch.Tensor, H: torch.Tensor, S: torch.Tensor, dt: float = 1.0,
-              residual: str = "last"):
+              residual: str = "last", H_res: Optional[torch.Tensor] = None,
+              S_res: Optional[torch.Tensor] = None):
     """
     One generator for the heavy path:  dpsi/dt = A psi,  A = S - iH,  U = exp(A dt).
 
     psi : [B, T, N] complex, UNNORMALISED dynamical state (normalise copies for readout).
     H   : [B, N, N] Hermitian,  S : [B, N, N] real symmetric.
-    residual="last": regularise only the final pair (psi[T-2] -> psi[T-1]); the generator was
-                     built from velocities up to that pair, so no future information is used.
+    residual="last": regularise only the final pair (psi[T-2] -> psi[T-1]).  If (H_res, S_res) are
+                     given they MUST be built from the prefix ending at T-2 (the transition target
+                     x[T-1] must not influence the generator that is tested against it); the full-window
+                     (H, S) is then used only to forecast beyond the window (returned U).
     residual="all" : legacy behaviour (end-of-window generator applied to every earlier pair,
                      which is NON-causal) - kept only as an ablation.
 
@@ -282,15 +285,19 @@ def propagate(psi: torch.Tensor, H: torch.Tensor, S: torch.Tensor, dt: float = 1
     """
     A = S.to(torch.complex64) - 1j * H
     U = torch.matrix_exp(A * dt)
+    if H_res is not None:
+        U_res = torch.matrix_exp((S_res.to(torch.complex64) - 1j * H_res) * dt)
+    else:
+        U_res = U
     if residual == "last":
         p0, p1 = psi[:, -2:-1], psi[:, -1:]
     elif residual == "all":
         p0, p1 = psi[:, :-1], psi[:, 1:]
     else:
         raise ValueError(f"residual must be 'last' or 'all', got {residual!r}")
-    pred = torch.einsum("bij,btj->bti", U, p0)
+    pred = torch.einsum("bij,btj->bti", U_res, p0)
     L_pde = (p1 - pred).abs().pow(2).mean()
-    UhU = U.conj().transpose(-1, -2) @ U
+    UhU = U_res.conj().transpose(-1, -2) @ U_res
     n0 = p0.abs().pow(2).sum(-1).clamp_min(1e-8)
     target = torch.einsum("bti,bij,btj->bt", p0.conj(), UhU, p0).real / n0 - 1.0
     obs = p1.abs().pow(2).sum(-1) / n0 - 1.0
