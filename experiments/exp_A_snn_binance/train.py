@@ -1,4 +1,9 @@
 """
+*** EXCLUDED FROM v3.1 CORRECTED COMPARISONS ***
+Experiment A still uses the pre-v3.1 pipeline (independent per-asset truncation instead of a common clock,
+label thresholds fitted on the full series, old encoder/surrogate). Its results are LEGACY and must not appear
+next to Exp B/C numbers. `main()` refuses to run unless QSPINN_ALLOW_LEGACY_EXPA=1 is set explicitly.
+
 experiments/exp_A_snn_binance/train.py
 =======================================
 experiments/exp_A_snn_binance/train.py
@@ -536,6 +541,10 @@ The key improvements over the toy:
 
 # ── entry point ───────────────────────────────────────────────────────────────
 def main():
+    import os
+    if os.environ.get("QSPINN_ALLOW_LEGACY_EXPA") != "1":
+        raise SystemExit("Exp A is excluded from corrected v3.1 comparisons (legacy pipeline). "
+                         "Set QSPINN_ALLOW_LEGACY_EXPA=1 to run it as a labelled legacy experiment.")
     log    = ExperimentLogger(OUT_DIR / "train.log",
                               experiment_name="Exp A — SNN Gate on Binance")
     device = get_device(verbose=True)

@@ -895,8 +895,11 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     log.section("Multi-Asset Ablation Suite")
     ablation_rows = []
 
-    lstm_epochs = 1 if epochs_a <= 2 else 15
-    lstm = train_lstm(Xtr, ytr, Xva, yva, device, epochs=lstm_epochs)
+    # Equal-budget baseline (same loop/optimiser/early stopping; epochs = hybrid's total stage epochs)
+    from baselines import train_classifier as _tc
+    lstm_epochs = epochs_a + epochs_b + epochs_c
+    lstm = _tc(LSTMBaseline(), Xtr, ytr, Xva, yva, device, macro_f1, epochs=lstm_epochs)
+    lstm.eval()
     lstm_preds = []
     with torch.no_grad():
         for i in range(0, len(Xte), 1024):

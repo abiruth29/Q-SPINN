@@ -22,11 +22,12 @@ a cheap event-driven spiking (LIF) gate decides, per window, whether an expensiv
 
 ## Data protocols
 
-* **FI-2010 Setup 2** — train on days 1–7, test on days 8–10, built by `python procure_fi2010.py --setup2`
-  (stock/day segments recovered and audited in `segment_audit.json`; windows never cross a segment; the last
-  `k` rows of each segment are purged). The old concatenated-fold protocol is available only as `--legacy_split`.
+* **FI-2010 Setup 2** — the protocol is train days 1–7 / test days 8–10; this code trains on **days 1–6, validates on
+  day 7, tests on days 8–10**. Built by `python procure_fi2010.py --setup2 --segments segment_lengths.json`, which
+  requires *verified* per-stock/day row counts and refuses to guess boundaries. Windows never cross a segment and the
+  last `k` rows of each segment are purged. The old concatenated-fold protocol exists only as `--legacy_split`.
 * **Binance (Exp C)** — BTC/ETH/SOL trades aggregated to a *common* 1-second clock with stale-second flags;
-  label thresholds are fit on the training span only; `ofi` was renamed `signed_volume` (it is trade-signed
+  label thresholds use only summaries lying entirely inside the training span; each asset is seeded from its own last pre-grid price (no backward fill) and long outages stop the run; `ofi` was renamed `signed_volume` (it is trade-signed
   volume, not order-flow imbalance from depth).
 
 ## Repository map
@@ -37,7 +38,8 @@ a cheap event-driven spiking (LIF) gate decides, per window, whether an expensiv
 | `experiments/exp_B_hybrid_fi2010/train.py` | FI-2010 training (three stages A/B/C); `routing_study.py`, `early_warning_study.py` run after it |
 | `experiments/exp_C_multi_asset_binance/train.py` | 3-asset crypto experiment |
 | `experiments/routing.py` | budgeted routing, conditional inference, early-warning metrics |
-| `experiments/live_contract.py`, `pipeline.py`, `dashboard.py` | live demo; refuses mismatched weights unless `--demo` |
+| `experiments/live_contract.py`, `pipeline.py`, `dashboard.py` | live demo; refuses weights without a matching protocol/contract, and mismatched ones unless `--demo`; dashboard shows no data unless a feed exists (simulation only via `QSPINN_DASH_MOCK=1`, labelled) |
+| `experiments/legacy_v3.0/` | archived pre-v3.1 weights and run state — rejected by the code, never to be loaded |
 | `tests/` | synthetic-data unit tests for every correction (`pytest -q`, ~10 s, no data or GPU needed) |
 | `docs/FIX_PLAN.md`, `docs/RUNBOOK_TEAMMATE.md` | what changed, and exactly what to run to regenerate results |
 
@@ -46,7 +48,7 @@ a cheap event-driven spiking (LIF) gate decides, per window, whether an expensiv
 ```bash
 pip install -r requirements.txt
 pytest -q                                   # must be green before any training run
-python procure_fi2010.py --setup2           # inspect data/reference/fi2010/segment_audit.json
+python procure_fi2010.py --setup2 --segments segment_lengths.json   # verified counts; see runbook §1
 python experiments/exp_B_hybrid_fi2010/train.py --horizon 10 --seed 0
 python experiments/exp_B_hybrid_fi2010/routing_study.py --horizon 10 --seed 0 --weights <weights.pt>
 ```

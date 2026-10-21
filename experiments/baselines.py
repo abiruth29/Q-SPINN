@@ -47,12 +47,12 @@ def count_params(m: nn.Module) -> int:
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
-def train_classifier(model, Xtr, ytr, Xva, yva, device, f1_fn, epochs=20, lr=1e-3, bs=512, seed=0):
+def train_classifier(model, Xtr, ytr, Xva, yva, device, f1_fn, epochs=20, lr=1e-3, bs=512, seed=0, patience=15):
     g = torch.Generator().manual_seed(seed)
     model = model.to(device); opt = torch.optim.Adam(model.parameters(), lr=lr)
     cw = 1.0 / torch.bincount(ytr, minlength=3).float().clamp(min=1)
     ce = nn.CrossEntropyLoss(weight=(cw / cw.sum() * 3.0).to(device))
-    best, snap = -1.0, None
+    best, snap, bad = -1.0, None, 0
     for _ in range(epochs):
         model.train(); perm = torch.randperm(len(Xtr), generator=g)
         for i in range(0, len(Xtr), bs):
@@ -64,7 +64,10 @@ def train_classifier(model, Xtr, ytr, Xva, yva, device, f1_fn, epochs=20, lr=1e-
             for i in range(0, len(Xva), 1024):
                 p.append(model(Xva[i:i + 1024].to(device)).argmax(1).cpu())
         f = f1_fn(torch.cat(p), yva)
-        if f > best: best, snap = f, {k: v.detach().clone() for k, v in model.state_dict().items()}
+        if f > best: best, snap, bad = f, {k: v.detach().clone() for k, v in model.state_dict().items()}, 0
+        else:
+            bad += 1
+            if patience and bad >= patience: break          # same early-stopping rule for every baseline
     if snap is not None: model.load_state_dict(snap)
     return model.eval()
 

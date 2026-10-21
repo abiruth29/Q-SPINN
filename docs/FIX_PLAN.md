@@ -59,17 +59,17 @@ section of the project report (Chapter 7) that describes the problem.
 | 3 | Aggregate gradient-norm guard | done |
 | 4 | Surrogate slope fixed (declared hyperparameter) | done |
 | 5 | Tie-safe routing budget | done |
-| 6 | Grouped AP, bootstrap start range / short series / segment blocks | done (segment-aware bootstrap wired in driver where segment ids exist) |
+| 6 | Grouped AP, bootstrap start range / short series / segment blocks | done (segment-aware blocks used in Exp B CIs) |
 | 7 | Encoder fit excludes joins | done |
 | 8 | Label / warning cutoffs use only fully-in-training summaries | done |
 | 9 | Causal grid seeding + long-gap policy | done |
 | 10 | Pre-load contract/protocol check for live demo | done |
 | 11 | Prefix-only residual generator through `heavy_path` | done |
 | 12 | Real conditional `infer()` (no loss-only work) | done |
-| 13 | Matched full-pipeline latency | done (driver) |
-| 14 | Authoritative FI-2010 segment metadata, fail closed | see below |
+| 13 | Matched full-pipeline latency | done (`routing_study.py`; numbers still need the teammate's CPU/GPU run) |
+| 14 | Authoritative FI-2010 segment metadata, fail closed | code done; **needs verified segment_lengths.json from the teammate** |
 | 15 | Scale-collapse loophole | done (relative residual + window anchor) |
-| 16 | Event-based warning lead time / false alarms per unit time | see below |
-| 17 | Exp A migration; equal baseline budgets | see below |
+| 16 | Event-based warning lead time / false alarms per unit time | done (`event_alert_metrics`, realised onsets, segment-safe) |
+| 17 | Exp A migration; equal baseline budgets | Exp A excluded (guarded); baselines get equal epoch budget/loop/early stopping, no tuning for any model |
 | 18 | Smoothing relabel | done |
 | 19 | Covariance disabled until observation model exists | unchanged (off) |

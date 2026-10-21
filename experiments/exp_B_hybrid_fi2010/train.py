@@ -975,12 +975,14 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
     parser.add_argument("--out_dir", type=str, default="", help="Custom output directory")
     parser.add_argument("--run_name", type=str, default="", help="Run tag for logs")
+    parser.add_argument("--baseline_epochs", type=int, default=0,
+                        help="epochs for LSTM/DeepLOB (0 = epochs_a+epochs_b+epochs_c, i.e. equal to the hybrid's budget)")
     parser.add_argument("--legacy_split", action="store_true",
                         help="Old concatenated-fold protocol (NOT Setup 2); results must be labelled legacy")
     return parser.parse_args()
 
 
-def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name="", legacy_split=False):
+def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name="", legacy_split=False, baseline_epochs=None):
     if horizon is None and __name__ == "__main__" and len(sys.argv) > 1:
         args = parse_args()
         horizon = args.horizon
@@ -992,6 +994,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         out_dir = Path(args.out_dir) if args.out_dir else OUT_DIR
         run_name = args.run_name
         legacy_split = args.legacy_split
+        baseline_epochs = args.baseline_epochs
     else:
         horizon = 10 if horizon is None else horizon
         seed = 0 if seed is None else seed
@@ -1074,8 +1077,12 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     log.section("Ablation suite")
     ablation_rows = []
 
-    lstm_epochs = 1 if epochs_a <= 2 else 20
-    lstm = train_lstm(Xtr, ytr, Xva, yva, device, epochs=lstm_epochs)
+    # Equal-budget baselines (review rank 17): same loop, optimiser, early-stopping rule, and an epoch budget equal
+    # to the hybrid's TOTAL stage epochs (no per-model tuning for ANY model - stated as a limitation in the paper).
+    from baselines import train_classifier as _tc
+    lstm_epochs = baseline_epochs if baseline_epochs else (epochs_a + epochs_b + epochs_c)
+    log.metric("Baseline epoch budget", lstm_epochs)
+    lstm = _tc(LSTMBaseline(), Xtr, ytr, Xva, yva, device, macro_f1, epochs=lstm_epochs, seed=seed)
     lstm.eval()
     lstm_preds = []
     with torch.no_grad():
@@ -1105,9 +1112,15 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
 
     from stats import block_bootstrap_f1
     ci = {}
+    if segs["test"] is None:
+        seg_w, blk = None, 200
+    else:     # blocks never straddle stock/day joins; block shrinks to fit the shortest segment
+        from qspinn_core import window_starts as _ws
+        seg_w = segs["test"][_ws(len(segs["test"]), SEQ_LEN, segs["test"], horizon) + SEQ_LEN - 1]
+        _c = np.bincount(seg_w - seg_w.min()); blk = int(max(1, min(200, _c[_c > 0].min())))
     for tag, mode in (("hybrid", "learned"), ("cheap", "cheap"), ("dense", "dense")):
         pr = evaluate(model, Xte, yte, rte, dt_te, mode=mode, return_pred=True)
-        ci[tag] = block_bootstrap_f1(pr.numpy(), yte.numpy(), n_boot=500)
+        ci[tag] = block_bootstrap_f1(pr.numpy(), yte.numpy(), n_boot=500, block=blk, seg=seg_w)
         log.metric(f"macro-F1 95% CI ({tag})", f"{ci[tag][0]:.3f} [{ci[tag][1]:.3f}, {ci[tag][2]:.3f}]")
     log.table(
         headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "w>0 rate"],
@@ -1166,6 +1179,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         "crash_p"            : full_m[6] if full_m[6] == full_m[6] else 0.0,
         "majority"           : majority,
         "majority_macro_f1"  : majority_f1,
+        "baseline_epochs"    : lstm_epochs,
         "f1_ci95"            : list(ci["hybrid"][1:]),
         "f1_ci95_cheap"      : list(ci["cheap"][1:]),
         "f1_ci95_dense"      : list(ci["dense"][1:]),

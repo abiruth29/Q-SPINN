@@ -14,23 +14,37 @@ If any test fails, stop and report it — do not train.
 
 ## 1. Data
 
-```bash
-python procure_fi2010.py --setup2          # builds data/reference/fi2010/fi2010_setup2.parquet
-cat data/reference/fi2010/segment_audit.json
-```
-**Inspect the audit.** Each partition lists `boundary_confidence` and `confident`. The train partition must have 35
-segments (7 days × 5 stocks), each test day 5. If any partition is `confident: false` (confidence < 1.5), the
-automatic stock/day boundary recovery is unreliable: take the per-stock/day row counts from the FI-2010 authors'
-documentation and put them in `experiments/fi2010_setup2.py::detect_segments` before training. Send us the audit file.
+**FI-2010 stock/day boundaries must be verified — the build refuses to guess.**
+The public files concatenate (days × 5 stocks) segments with no id column. Setup 2 uses Train CF7 (days 1–7) and Test CF7/CF8/CF9
+(days 8, 9, 10). You must supply the verified per-segment row counts (in file order) as a JSON file:
 
-Binance data (Exp C) is unchanged: `data/` must contain the curated BTCUSDT/ETHUSDT/SOLUSDT parquet partitions.
+```json
+{"train": [<35 row counts>], "test_d8": [<5>], "test_d9": [<5>], "test_d10": [<5>]}
+```
+Take the counts from the FI-2010 authors' documentation / per-stock-per-day statistics (or reconstruct them by parsing the raw
+LOBSTER-style source if you have it). Each list must sum **exactly** to the number of rows in the file; the build checks count,
+positivity and coverage and stops otherwise.
+
+```bash
+python procure_fi2010.py --setup2 --segments segment_lengths.json
+cat data/reference/fi2010/segment_audit.json     # every partition must say provenance: authoritative
+```
+`--allow-heuristic` exists for exploration only (jump-based guess); the training loader **refuses** a heuristic parquet.
+If you cannot obtain verified counts, stop and tell us — do not train on guessed boundaries.
+
+Note on the split actually used: **train = days 1–6, validation = day 7, test = days 8–10** (the last training day is held
+out for model selection). Describe it that way in the paper.
+
+Binance data (Exp C): `data/curated/trades/symbol=BTCUSDT|ETHUSDT|SOLUSDT/...` parquet partitions. The pipeline aligns the three
+assets on a common 1 s clock and **stops** if more than 1 % of the grid lies inside a >300 s outage of any asset — in that case
+split the series at the gaps first and tell us.
 
 ## 2. Smoke run (≈ minutes) — proves the pipeline end to end
 
 ```bash
 python experiments/run_unattended_suite.py --test
 ```
-Runs 1 epoch/stage for k=10 seed 0 plus a small Binance job. The numbers are meaningless; only crashes matter.
+Runs 1 epoch/stage for k=10 seed 0 plus a small Binance job. Old `suite_state.json` files are ignored: completed jobs from a different `PROTOCOL_VERSION` are retrained automatically (legacy state/weights are archived under `experiments/legacy_v3.0/` and cannot be loaded). The numbers are meaningless; only crashes matter.
 
 ## 3. Full runs
 
@@ -41,8 +55,8 @@ python experiments/exp_B_hybrid_fi2010/train.py --horizon 10 --seed 0
 ```
 Output per run: `RESULTS_k{H}_s{S}.md`, weights `qspinn_fi2010_k{H}_s{S}.pt`, a `*_contract.json`, and a summary
 containing macro-F1 with a 95 % block-bootstrap interval for the hybrid, SNN-only and heavy-only models, the
-majority-class macro-F1, global gate rate, and two baselines trained with the same budget (LSTM, re-implemented
-DeepLOB). The runner resumes after a crash (state in `suite_state.json`); `--reset` starts over.
+majority-class macro-F1, global gate rate, and two baselines (LSTM, re-implemented DeepLOB) trained with the same loop,
+optimiser, early-stopping rule and an epoch budget equal to the hybrid's total (`--baseline_epochs` overrides). No model is hyper-parameter tuned — state this as a limitation. The runner resumes after a crash (state in `suite_state.json`); `--reset` starts over.
 
 Use `--legacy_split` only to reproduce the old protocol for a comparison table; label it legacy.
 
@@ -54,11 +68,12 @@ python $W/routing_study.py       --horizon 10 --seed 0 --weights $W/qspinn_fi201
 python $W/early_warning_study.py --horizon 10 --seed 0 --weights $W/qspinn_fi2010_k10_s0.pt
 ```
 * `routing_study_k10_s0.json` — validation macro-F1 vs routing fraction for the learned gate, confidence cascade,
-  rolling-volatility router, benefit head and random; budget chosen on validation only; test result at that fixed
-  threshold; CPU/GPU latency of conditional vs dense heavy inference (warm-up + synchronisation included).
+  rolling-volatility router (per-segment), benefit head and random; budget chosen on validation only with a tie-safe rule;
+  test result at that fixed threshold; **matched full-pipeline latency** (raw windows → logits, eval/no_grad, same chunking,
+  warm-up, device sync) for cheap-only, dense heavy and the real conditional hybrid at several routing fractions.
   Run on **both CPU and GPU** if possible (`CUDA_VISIBLE_DEVICES=` for CPU).
-* `early_warning_k10_s0.json` — AUROC / AUPRC / Brier / false-alarm rate / lead time of ω vs a rolling-vol
-  baseline on untouched test days. If ω does not beat the baseline, ω stays a "latent-flow diagnostic" in the paper.
+* `early_warning_k10_s0.json` — AUROC / AUPRC / Brier (future-window label) plus **event-based** lead time, detection rate and false
+  alerts (per 1000 rows) of ω vs a rolling-vol baseline against *realised* shock onsets, per stock/day segment, on untouched test days. If ω does not beat the baseline, ω stays a "latent-flow diagnostic" in the paper.
 
 ## 5. What to send back
 
@@ -73,11 +88,13 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 4. No lead-lag claim from the magnetic-Laplacian phase; at most report the gauge-invariant loop flux.
 5. Live-demo outputs are labelled DEMONSTRATION unless a model was retrained on the live input contract.
 
-## 7. Not done on purpose (Phase 4 — needs a defensible data model first)
+## 7. Not done on purpose
 
-* Item 18: covariance training / uncertainty (`van_loan`, `cov_head` are excluded from optimisation; flag `USE_COVARIANCE`).
-* Item 19: drift-Jacobian / anti-collapse ablation.
-* Item 20: cross-asset lead-lag research on aligned series (the aligned data pipeline is ready; the study is not written).
+* Covariance training / uncertainty (`van_loan`, `cov_head` excluded; flag `QSPINN_USE_COV=1`) — needs an observation model and innovation likelihood first.
+* Drift-Jacobian / anti-collapse *ablation* against unstructured alternatives; the anchor and relative residual are in, their ablation (`QSPINN_LAMBDA_SCALE=0`, `QSPINN_RESIDUAL=all`) is yours to run if the paper makes a physics claim.
+* Cross-asset lead-lag research; Experiment A is excluded (legacy pipeline).
+* A live model retrained on crypto inputs: the live pipeline refuses FI-2010 weights unless `--demo`.
+* Hyper-parameter tuning of any model (equal-budget, untuned comparison only).
 
 ## 8. Change → code map
 
