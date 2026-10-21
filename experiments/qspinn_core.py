@@ -334,3 +334,25 @@ def propagate(psi: torch.Tensor, H: torch.Tensor, S: torch.Tensor, dt: float = 1
     obs = p1.abs().pow(2).sum(-1) / n0 - 1.0
     L_norm = (obs - target).pow(2).mean()
     return U, L_pde, L_norm
+
+
+# ── benefit-trained routing gate (review 4, item 3) ───────────────────────────
+def expert_benefit(cheap_logits: torch.Tensor, heavy_logits: torch.Tensor, y: torch.Tensor):
+    """Per-row predictive benefit of the heavy expert: CE(cheap) - CE(heavy).  Both inputs are detached teachers."""
+    import torch.nn.functional as F
+    return (F.cross_entropy(cheap_logits.detach(), y, reduction="none")
+            - F.cross_entropy(heavy_logits.detach(), y, reduction="none"))
+
+
+def benefit_gate_loss(gate_logit: torch.Tensor, benefit: torch.Tensor, margin: float = 0.0, scale: float = 4.0,
+                      cap: float = 3.0):
+    """
+    BCE of the gate logit against 'heavy helps' (benefit > margin), each row weighted by 1 + min(|benefit|, cap) so
+    rows where the expert matters most dominate.  The compute budget is enforced separately (rate penalty here,
+    validation-chosen threshold at deployment).  Target is NOT volatility: a calm row where the heavy expert
+    helps is positive, a volatile row where it does not is negative.
+    """
+    import torch.nn.functional as F
+    t = (benefit.detach() > margin).to(gate_logit.dtype)
+    w = 1.0 + benefit.detach().abs().clamp(max=cap)
+    return (w * F.binary_cross_entropy_with_logits(gate_logit * scale, t, reduction="none")).mean()

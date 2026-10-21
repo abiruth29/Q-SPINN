@@ -12,7 +12,7 @@ WHAT THIS DOES
 3. Trains the full 3-asset Q-SPINN incorporating:
    - Continuous-time Magnetic Graph Laplacian (directed phase flux W_ij = A_ij * exp(i*Phi_ij))
    - Van Loan Continuous-to-Discrete Covariance Propagation
-   - Early Warning System (Numerical Abscissa contractive regularization)
+   - Concurrent-regime alignment of the numerical abscissa ω (diagnostic, not a forward predictor)
    - Event-driven SNN Gating
 4. Reports the gauge-invariant loop flux of the learned phase matrix (no lead-lag claim).
 5. Compares against SNN-only, PINN-only, and LSTM baselines.
@@ -39,7 +39,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from device import get_device
 from logger import ExperimentLogger
 from checkpoint import save_checkpoint, load_checkpoint, guard_nan
-from qspinn_core import (propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
+from qspinn_core import (expert_benefit, benefit_gate_loss, propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
                          StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
                          stage_c_mode, heavy_teacher_ctx)
 import os
@@ -512,8 +512,7 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
     combined_feats = np.concatenate(all_feats, axis=1)        # [n_len, 18]
 
     # Primary label: mean BTC log-return over the NEXT HORIZON seconds, thresholds from the train span.
-    n_total = n_len - SEQ_LEN - HORIZON
-    train_end_row = int(n_total * TRAIN_FRAC) + SEQ_LEN
+    train_end_row = split_plan(n_len)["label_support_end"]     # only returns a train label actually reads
     labels, (lo, hi) = forward_labels(all_feats[0][:, 0], HORIZON, train_end_row)
     labels[labels < 0] = 1                                    # padded tail is never used (purged below)
     log.info(f"Label thresholds (train-only): down < {lo:.3e}, up > {hi:.3e}")
@@ -531,12 +530,31 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
     return combined_feats, labels, regime
 
 
-def make_windows_binance(feats, labels, regime):
-    n_total = len(feats) - SEQ_LEN - HORIZON
-    n_train = int(n_total * TRAIN_FRAC)
-    n_val   = int(n_total * VAL_FRAC)
+def split_plan(n_len: int) -> dict:
+    """
+    Single source of truth for the chronological crypto split (review 4, item 1).
+    Window i reads input rows [i, i+SEQ_LEN) and its label reads returns on rows (t, t+HORIZON] with
+    t = i+SEQ_LEN-1.  Window boundaries purge HORIZON windows so label support never crosses a split.
+      scaler_end         exclusive row bound for feature scaling: only rows READ AS INPUT by a train window.
+      label_support_end  exclusive row bound for label thresholds: only returns used by a train label.
+    Validation/test windows may READ earlier rows as input context (causal history); that shared input
+    history is not target leakage and is not counted as such.
+    """
+    n_total = n_len - SEQ_LEN - HORIZON
+    n_train = int(n_total * TRAIN_FRAC); n_val = int(n_total * VAL_FRAC)
+    n = n_len - SEQ_LEN - HORIZON + 1
+    tr_end, va_end = n_train, n_train + n_val
+    tr_hi, va_hi = tr_end - HORIZON, va_end - HORIZON
+    return dict(n=n, tr_end=tr_end, va_end=va_end, tr_hi=tr_hi, va_hi=va_hi,
+                scaler_end=tr_hi - 1 + SEQ_LEN,
+                label_support_end=(tr_hi - 1) + SEQ_LEN - 1 + HORIZON + 1)
 
-    train_feats = feats[:n_train + SEQ_LEN]
+
+def make_windows_binance(feats, labels, regime):
+    sp = split_plan(len(feats))
+    n, tr_end, va_end, tr_hi, va_hi = sp["n"], sp["tr_end"], sp["va_end"], sp["tr_hi"], sp["va_hi"]
+
+    train_feats = feats[:sp["scaler_end"]]          # inputs of train windows only (never a validation-only row)
     mu = train_feats.mean(0, keepdims=True)
     sd = train_feats.std(0, keepdims=True) + 1e-8
     x_norm = (feats - mu) / sd
@@ -551,13 +569,7 @@ def make_windows_binance(feats, labels, regime):
     rw = rt.unfold(0, SEQ_LEN, 1).max(dim=1)[0]
     yw = yt[SEQ_LEN - 1:]
 
-    # Task 06/11: keep every window whose label is real (last HORIZON labels are padding)
-    # and purge HORIZON windows before each split boundary so labels never peek across it.
-    n = len(feats) - SEQ_LEN - HORIZON + 1
-    tr_end = n_train
-    va_end = n_train + n_val
-    tr_hi, va_hi = tr_end - HORIZON, va_end - HORIZON
-
+    # keep every window whose label is real; HORIZON windows are purged before each split boundary.
     return (Xw[:tr_hi], yw[:tr_hi], rw[:tr_hi], dt_w[:tr_hi],
             Xw[tr_end:va_hi], yw[tr_end:va_hi], rw[tr_end:va_hi], dt_w[tr_end:va_hi],
             Xw[va_end:n], yw[va_end:n], rw[va_end:n], dt_w[va_end:n])
@@ -637,7 +649,7 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
 
 
 def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage B — Heavy Path (Magnetic Graph Laplacian + EWS) ({epochs} epochs)")
+    log.section(f"Stage B — Heavy Path (Magnetic Graph Laplacian + concurrent-regime ω alignment) ({epochs} epochs)")
     params_heavy = list(model.amp.parameters()) + list(model.ham.parameters()) + list(model.head.parameters())
     opt_heavy = torch.optim.Adam(params_heavy, lr=LR)
     
@@ -701,8 +713,8 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
     return model
 
 
-def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage C — Multi-Asset Gate Arbitration ({epochs} epochs)")
+def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE, gate_objective="legacy"):
+    log.section(f"Stage C — Multi-Asset Gate Arbitration ({epochs} epochs, objective={gate_objective})")
     gate_params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_regime]
     params = stage_c_mode(model, gate_params)   # Task 03
     model.heavy_frozen = True
@@ -736,6 +748,11 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             loss_ce = ce(logits, yb)
             loss_gate = g.mean()
             loss_regime = bce(gl * 4.0, rb)
+            if gate_objective == "benefit":
+                with torch.no_grad():
+                    cheap_l = model.gate(Sb, dt_b)[0]
+                    heavy_l = model.heavy_infer(Xb)
+                loss_regime = benefit_gate_loss(gl, expert_benefit(cheap_l, heavy_l, yb))
             
             log_ce = torch.clamp(model.log_var_ce, min=-5.0, max=10.0)
             log_regime = torch.clamp(model.log_var_regime, min=-5.0, max=10.0)
@@ -743,7 +760,7 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             adaptive_regime = loss_regime * torch.exp(-log_regime) + log_regime
             
             loss_gate_target = torch.relu(loss_gate - 0.10) * 5.0 + 0.2 * loss_gate
-            loss = adaptive_ce + adaptive_regime + loss_gate_target
+            loss = (loss_regime + loss_gate_target) if gate_objective == "benefit" else (adaptive_ce + adaptive_regime + loss_gate_target)
             guard.step(loss, params, opt)
             if guard.halt:
                 log.warn(f"Stage C: {guard.consecutive} consecutive non-finite updates; halting."); break
@@ -863,7 +880,7 @@ def train_lstm(Xtr, ytr, Xva, yva, device, epochs=15):
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
-def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE):
+def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy"):
     torch.manual_seed(SEED); np.random.seed(SEED)
     log = ExperimentLogger(OUT_DIR / "train.log", experiment_name="Exp C — 3-Asset Binance Basket")
     device = get_device(verbose=True)
@@ -889,7 +906,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
         model = stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log, epochs=epochs_a, batch_size=batch_size)
     if current_stage != "C":
         model = stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log, epochs=epochs_b, batch_size=batch_size)
-    model = stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log, epochs=epochs_c, batch_size=batch_size)
+    model = stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log, epochs=epochs_c, batch_size=batch_size, gate_objective=gate_objective)
 
     log.section("Multi-Asset Ablation Suite")
     ablation_rows = []

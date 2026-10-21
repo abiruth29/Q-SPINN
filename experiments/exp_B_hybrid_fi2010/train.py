@@ -47,7 +47,7 @@ from logger import ExperimentLogger
 from checkpoint import save_checkpoint, load_checkpoint, guard_nan
 from qspinn_core import (propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
                          StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
-                         stage_c_mode, heavy_teacher_ctx)
+                         stage_c_mode, heavy_teacher_ctx, expert_benefit, benefit_gate_loss)
 
 # GPU Optimizations
 if torch.cuda.is_available():
@@ -646,7 +646,7 @@ def eval_stage_B(model, Xva, yva, device, batch_size=1024):
 
 
 def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage B — Heavy path (EM Cross-Fitted Training + EWS Regularization) ({epochs} epochs)")
+    log.section(f"Stage B — Heavy path (EM Cross-Fitted Training + concurrent-regime alignment of ω) ({epochs} epochs)")
     
     # Joint Optimization for Physics Generator + Classification Head
     params_heavy = list(model.amp.parameters()) + list(model.ham.parameters()) + list(model.head.parameters())
@@ -683,13 +683,15 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             # Joint PINN Forward Pass
             heavy, L_pde, H, S, L_cov, L_norm = model.heavy_path(Xb)
             
-            # EWS Numerical Abscissa Stability Loss (Eq 28.3)
-            # Contractive dynamics (omega <= -0.02) during normal regimes (rb == 0)
-            # Expansive dynamics (omega >= +0.02) during volatility shocks (rb == 1)
+            # Concurrent-regime alignment of ω (Eq 28.3).  The target `rb` is a TRAILING realised-volatility flag, i.e. already
+            # observed at the forecast origin: this teaches ω to describe the CURRENT regime. It is NOT forward-warning
+            # supervision, so ω is a current-regime / latent-flow diagnostic, not a predictor (review 4, item 2).
+            # Contractive dynamics (omega <= -0.02) when trailing volatility is normal (rb == 0)
+            # Expansive dynamics (omega >= +0.02) when trailing volatility is already elevated (rb == 1)
             omegas = torch.linalg.eigvalsh(S)[:, -1]
             loss_ews = (torch.relu(omegas + 0.02) * (1.0 - rb) + torch.relu(0.02 - omegas) * rb).mean()
             
-            # V3-04 & V3-05: Structural constraints + EWS + Classification Loss
+            # V3-04 & V3-05: Structural constraints + regime alignment + Classification Loss
             loss_phys = LAMBDA_PDE * L_pde + 0.1 * L_cov + 0.1 * L_norm + 0.1 * loss_ews
             loss_head = ce(heavy, yb)
             loss = loss_phys + loss_head
@@ -742,8 +744,8 @@ def eval_stage_C(model, Xva, yva, dt_va, device, batch_size=1024):
     return f1, meter.rate
 
 
-def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage C — Gate head arbitration  ({epochs} epochs)")
+def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE, gate_objective="legacy"):
+    log.section(f"Stage C — Gate head arbitration  ({epochs} epochs, objective={gate_objective})")
     gate_params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_regime]
     params = stage_c_mode(model, gate_params)   # Task 03: heavy frozen + eval + no-grad teacher
     model.heavy_frozen = True
@@ -778,6 +780,12 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             loss_ce = ce(logits, yb)
             loss_gate = g.mean()
             loss_regime = bce(gl * 4.0, rb)
+            if gate_objective == "benefit":
+                # Route by predictive BENEFIT of the heavy expert (frozen teacher), not by trailing volatility.
+                with torch.no_grad():
+                    cheap_l = model.gate(Sb, dt_b)[0]
+                    heavy_l = model.heavy_infer(Xb)
+                loss_regime = benefit_gate_loss(gl, expert_benefit(cheap_l, heavy_l, yb))
             
             # SWAP-08: Adaptive Loss Weighting (Kendall et al. 2018)
             log_ce = torch.clamp(model.log_var_ce, min=-5.0, max=10.0)
@@ -788,7 +796,7 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             
             # Sparsity enforcement: penalize gate rates over 10%
             loss_gate_target = torch.relu(loss_gate - 0.10) * 5.0 + 0.2 * loss_gate
-            loss = adaptive_ce + adaptive_regime + loss_gate_target
+            loss = (loss_regime + loss_gate_target) if gate_objective == "benefit" else (adaptive_ce + adaptive_regime + loss_gate_target)
             guard.step(loss, params, opt)
             if guard.halt:
                 log.warn(f"Stage C: {guard.consecutive} consecutive non-finite updates skipped; halting.")
@@ -837,7 +845,7 @@ def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024, return_pred=
             rates.append(rate.cpu())
             pdes.append(L_pde.cpu())
             
-            # EWS Metric: Numerical Abscissa (omega) is max eigenvalue of Symmetric matrix S
+            # Diagnostic: Numerical Abscissa (omega) is max eigenvalue of Symmetric matrix S
             batch_omegas = torch.linalg.eigvalsh(S)[:, -1]
             omegas.append(batch_omegas.cpu())
             
@@ -946,7 +954,7 @@ def write_results(ablation_rows, m_full, timestamp, device_name, majority, out_p
 Three-stage training was used:
 
 1. **Stage A ({ep_a} epochs):** SNN gate cheap head only (heavy path frozen)
-2. **Stage B ({ep_b} epochs):** Heavy path only + EWS regularization (SNN frozen)
+2. **Stage B ({ep_b} epochs):** Heavy path only + concurrent-regime alignment of ω (SNN frozen)
 3. **Stage C ({ep_c} epochs):** Gate head only with sparsity calibration (everything else frozen)
 
 ## Notes on interpretation
@@ -977,12 +985,14 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default="", help="Run tag for logs")
     parser.add_argument("--baseline_epochs", type=int, default=0,
                         help="epochs for LSTM/DeepLOB (0 = epochs_a+epochs_b+epochs_c, i.e. equal to the hybrid's budget)")
+    parser.add_argument("--gate_objective", default="legacy", choices=["legacy", "benefit"],
+                        help="Stage C gate target: legacy (CE+trailing-vol BCE) or benefit (heavy-vs-cheap predictive benefit)")
     parser.add_argument("--legacy_split", action="store_true",
                         help="Old concatenated-fold protocol (NOT Setup 2); results must be labelled legacy")
     return parser.parse_args()
 
 
-def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name="", legacy_split=False, baseline_epochs=None):
+def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name="", legacy_split=False, baseline_epochs=None, gate_objective=None):
     if horizon is None and __name__ == "__main__" and len(sys.argv) > 1:
         args = parse_args()
         horizon = args.horizon
@@ -995,7 +1005,9 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         run_name = args.run_name
         legacy_split = args.legacy_split
         baseline_epochs = args.baseline_epochs
+        gate_objective = args.gate_objective
     else:
+        gate_objective = gate_objective or "legacy"
         horizon = 10 if horizon is None else horizon
         seed = 0 if seed is None else seed
         epochs_a = EPOCHS_A if epochs_a is None else epochs_a
@@ -1067,7 +1079,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
                             epochs=epochs_b, ckpt_path=ckpt_path, batch_size=batch_size)
             
         model = stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log,
-                        epochs=epochs_c, ckpt_path=ckpt_path, batch_size=batch_size)
+                        epochs=epochs_c, ckpt_path=ckpt_path, batch_size=batch_size, gate_objective=gate_objective)
     except Exception as e:
         log.warn(f"Training crashed: {type(e).__name__}: {e}")
         log.warn("Last checkpoint is intact — re-run to resume from the last completed epoch.")

@@ -80,3 +80,11 @@ section of the project report (Chapter 7) that describes the problem.
 3. **Event warning evaluation**: one alarm policy (episode start + renewal every tau rows) drives detection, lead and false alarms; at-risk clock = `eligible` rows; warm-up and segment-end events/alarms are CENSORED (reported as `events_censored`, `alarms_censored`), never counted as misses/false alarms; exposure = eligible rows. Rates are per `rows_per_unit_time`, not per hour.
 4. External (teammate): verified FI-2010 `segment_lengths.json` with day/stock order and source-file identity; actual split = train days 1-6 / val day 7 / test days 8-10.
 5. External (teammate): report actual epochs/updates executed for baselines vs hybrid; paired segment-aware differences vs baselines.
+
+## Review 4 (remaining changes v3.1.1) — implemented in code/docs
+01. `split_plan`: scaler and label thresholds restricted to train-window support; 500-row fixture tests.
+02. ω classified as current-regime diagnostic; Stage B/C wording, dashboard and docs de-"EWS"-ed.
+03. Benefit-trained gate (`expert_benefit`, `benefit_gate_loss`, `--gate_objective`), original router kept as default/comparator.
+04. `live_step`: gate-first live inference; ω fresh/cached/unavailable; `--omega_mode`; end-to-end latency logged.
+05. Runbook/README/presentation synced; docs tests guard against stale claims.
+Evidence-dependent (teammate): 06 verified FI segment metadata, 07 real-crypto outage validation + live/train feature contract, 08 fresh weights + controlled studies, 09 warning-quality study on untouched forward targets.

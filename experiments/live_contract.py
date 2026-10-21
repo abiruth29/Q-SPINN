@@ -64,3 +64,51 @@ class LiveWindow:
         if not self.ready:
             raise RuntimeError("window not full")
         return torch.from_numpy(np.stack(self.buf)).unsqueeze(0)
+
+
+# ── truthful live compute / omega contract (review 4, item 4) ─────────────────
+class OmegaState:
+    """Last FRESHLY computed omega and how many ticks ago it was computed."""
+    def __init__(self):
+        self.value = None; self.age = 0
+
+    def fresh(self, v: float):
+        self.value, self.age = float(v), 0
+
+    def stale(self):
+        if self.value is not None:
+            self.age += 1
+
+
+def live_step(model, x, dt, state: OmegaState, omega_mode: str = "gated"):
+    """
+    One live tick.
+      omega_mode="gated"  : gate first.  Heavy path (and therefore omega) is computed ONLY when the gate routes the
+                            row; otherwise the cheap prediction is used and omega is reported as 'cached' (last fresh
+                            value + age) or 'unavailable' (never computed).  No routed row => zero heavy calls.
+      omega_mode="always" : heavy path on every tick, omega always fresh.  NO compute-saving claim may be made.
+    Returns a dict including `heavy_calls`, `omega`, `omega_status` in {fresh, cached, unavailable} and
+    `latency_ms` measured end-to-end (encode + gate + routed heavy work).
+    """
+    import time as _t
+    import torch
+    if omega_mode not in ("gated", "always"):
+        raise ValueError(omega_mode)
+    t0 = _t.perf_counter()
+    with torch.no_grad():
+        model.eval()
+        sp = model.encode(x)
+        cheap, g, _, _ = model.gate(sp, dt)
+        routed = True if omega_mode == "always" else bool(g[0] > 0.5)
+        heavy_calls = 0
+        if routed:
+            heavy, _, _, S, _, _ = model.heavy_path(x)
+            state.fresh(torch.linalg.eigvalsh(S)[:, -1].item())
+            logits = heavy; heavy_calls = 1; status = "fresh"
+        else:
+            state.stale()
+            logits = cheap
+            status = "cached" if state.value is not None else "unavailable"
+    return dict(pred=int(logits.argmax(1)[0]), routed=routed, heavy_calls=heavy_calls,
+                omega=state.value, omega_status=status, omega_age_ticks=state.age if status != "fresh" else 0,
+                omega_mode=omega_mode, latency_ms=(_t.perf_counter() - t0) * 1e3)

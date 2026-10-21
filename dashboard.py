@@ -5,14 +5,14 @@ import plotly.graph_objects as go
 import time
 from collections import deque
 
-st.set_page_config(page_title="Q-SPINN Early Warning System", layout="wide", page_icon="⚛️")
+st.set_page_config(page_title="Q-SPINN Latent-Flow Monitor", layout="wide", page_icon="⚛️")
 
 st.title("⚛️ Q-SPINN Latent-Flow Monitor (research prototype)")
 st.markdown("Live display of the latent-flow diagnostic ω = λ_max(S). **Not a validated crash predictor**: the alert score below is an uncalibrated sigmoid of ω, and until the forward early-warning study (docs/RUNBOOK_TEAMMATE.md, item 10) shows ω beats a rolling-volatility baseline, treat it as a diagnostic only.")
 
 # --- Sidebar Controls ---
 with st.sidebar:
-    st.header("⚙️ EWS Controls")
+    st.header("⚙️ Monitor Controls")
     if st.button("Reset Dashboard History", use_container_width=True):
         st.session_state.history.clear()
         st.session_state.last_omega = -0.3
@@ -70,6 +70,16 @@ if data is None:
     st.stop()
 if ALLOW_MOCK and not data.get('mode'):
     data['mode'] = 'SIMULATED DATA - not model output'
+
+if data.get('omega') is None:
+    st.info("ω unavailable: the gate has not routed any window to the heavy expert yet (gated mode). "
+            f"Latest cheap-path latency: {data.get('latency_ms', float('nan')):.1f} ms.")
+    st.stop()
+if data.get('omega_status') == 'cached':
+    st.caption(f"ω is CACHED from {data.get('omega_age_ticks', '?')} ticks ago (heavy path skipped on the latest ticks).")
+elif data.get('omega_status') == 'fresh':
+    st.caption("ω is fresh (heavy path ran on this tick)." + ("" if data.get('omega_mode') != 'always'
+               else " Always-on mode: no compute-saving claim."))
 
 # Uncalibrated alert score (sigmoid of omega) - NOT a probability of a crash
 crash_prob = 1 / (1 + np.exp(-20 * (data['omega'] - dynamic_threshold)))
@@ -153,7 +163,7 @@ with chart_col2:
         
     fig_line.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text=f"Critical Threshold (ω={dynamic_threshold:.2f})")
     fig_line.update_layout(
-        title="Real-Time EWS Metrics", 
+        title="Real-Time Diagnostic Metrics", 
         yaxis=dict(title="Alert score (not a probability)", range=[0, 1]),
         yaxis2=dict(title="Diagnostic Scale", overlaying="y", side="right"),
         height=350,

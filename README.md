@@ -55,3 +55,9 @@ python experiments/exp_B_hybrid_fi2010/routing_study.py --horizon 10 --seed 0 --
 
 The long-form mathematical reference is `Q_SPINN_COMPLETE_REFERENCE_DOCUMENT.md`; it predates v3.1 and its
 result tables are superseded.
+
+## Current policies (v3.1.2)
+- Binance builder fails closed on ANY outage > 300 s; crypto split/scaler/label-threshold support is defined by `split_plan` (no validation-only row enters scaling).
+- ω is a current-regime / latent-flow diagnostic. Stage B supervises it against a trailing-volatility flag; it is not forward-warning supervision.
+- `--gate_objective benefit` trains the gate on heavy-vs-cheap predictive benefit; `legacy` stays the default until the routing study shows benefit helps.
+- Live pipeline is gate-first (`--omega_mode gated`): ω is fresh / cached / unavailable, never silently recomputed; `always` mode makes no compute-saving claim.

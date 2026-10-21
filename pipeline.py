@@ -14,7 +14,7 @@ from ingestor import stream_live
 from exp_B_hybrid_fi2010.train import QSPINN, N_ASSETS
 
 from lob_extractor import FI2010Extractor
-from live_contract import make_contract, load_contract, contracts_match, LiveWindow
+from live_contract import make_contract, load_contract, contracts_match, LiveWindow, OmegaState, live_step
 from exp_B_hybrid_fi2010.train import SEQ_LEN, N_FEATURES
 
 # Initialize the Q-SPINN.  Order matters (review item 10): decide on the input/protocol contract BEFORE loading
@@ -42,6 +42,8 @@ else:
         WEIGHTS_ERROR = f"weights do not fit the current architecture: {type(e).__name__}: {str(e)[:200]}"
 model.eval()
 window = LiveWindow(SEQ_LEN, N_FEATURES)
+omega_state = OmegaState()
+OMEGA_MODE = "gated"     # set from --omega_mode in main()
 
 LOG_FILE = ROOT / "live_inference.jsonl"
 last_write = time.time()
@@ -88,21 +90,25 @@ async def process_tick(stream_name, payload):
         return
     features = window.tensor().to(device)
 
-    # LIVE INFERENCE: heavy path -> generator S; omega = lambda_max(S) is a LATENT-FLOW DIAGNOSTIC,
-    # not a validated crash probability (see docs/RUNBOOK_TEAMMATE.md, item 10).
-    with torch.no_grad():
-        heavy, L_pde, H, S, L_cov, L_norm = model.heavy_path(features)
-        omega = torch.linalg.eigvalsh(S)[:, -1].item()
-        omega_history.append(omega)
-        Omega_T = sum(omega_history) * 0.5
-        d_J = torch.trace(S[0]).item()
+    # LIVE INFERENCE (truthful compute contract): gate first; omega exists only when the heavy path actually ran
+    # (fresh), otherwise it is shown as cached/unavailable.  omega is a LATENT-FLOW DIAGNOSTIC, not a crash probability.
+    dt = torch.ones(1, SEQ_LEN, device=device)
+    r = live_step(model, features, dt, omega_state, OMEGA_MODE)
+    if r["omega_status"] == "fresh":
+        omega_history.append(r["omega"])
+    Omega_T = sum(omega_history) * 0.5          # integral over FRESH samples only (not time-uniform in gated mode)
 
     data = {
         "time": datetime.now().strftime("%H:%M:%S"),
         "mode": MODE,
-        "omega": omega,
+        "omega": r["omega"],
+        "omega_status": r["omega_status"],
+        "omega_age_ticks": r["omega_age_ticks"],
+        "omega_mode": r["omega_mode"],
+        "routed": r["routed"],
+        "heavy_calls": r["heavy_calls"],
+        "latency_ms": r["latency_ms"],
         "Omega_T": Omega_T,
-        "d_J": d_J,
         "BTC": prices["btc"],
         "ETH": prices["eth"],
         "SOL": prices["sol"]
@@ -117,16 +123,21 @@ import argparse
 async def main():
     parser = argparse.ArgumentParser(description="Q-SPINN Live Pipeline")
     parser.add_argument("--backfill", action="store_true", help="Run historical data backfill before streaming")
+    parser.add_argument("--omega_mode", choices=["gated", "always"], default="gated",
+                        help="gated: heavy path/omega only on gate-routed ticks (omega cached/unavailable otherwise); "
+                             "always: heavy path every tick (no compute-saving claim)")
     parser.add_argument("--demo", action="store_true",
                         help="allow running with weights whose training contract does not match the live inputs")
     args = parser.parse_args()
+    global OMEGA_MODE
+    OMEGA_MODE = args.omega_mode
     if WEIGHTS_ERROR:
         raise SystemExit(f"Refusing to run: {WEIGHTS_ERROR}")
     if not CONTRACT_OK and not args.demo:
         raise SystemExit("Refusing to run: training/live input contract mismatch on "
                          f"{CONTRACT_MISMATCH}. Retrain on matched live inputs, or pass --demo to run a "
                          "clearly labelled demonstration.")
-    print(f"Mode: {MODE}")
+    print(f"Mode: {MODE}  |  omega mode: {OMEGA_MODE}" + ("" if OMEGA_MODE == "gated" else "  (heavy path every tick: no compute-saving claim)"))
     print("=== Launching Q-SPINN Production Pipeline ===")
     
     if args.backfill:

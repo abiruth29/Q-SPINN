@@ -36,8 +36,7 @@ Note on the split actually used: **train = days 1–6, validation = day 7, test 
 out for model selection). Describe it that way in the paper.
 
 Binance data (Exp C): `data/curated/trades/symbol=BTCUSDT|ETHUSDT|SOLUSDT/...` parquet partitions. The pipeline aligns the three
-assets on a common 1 s clock and **stops** if more than 1 % of the grid lies inside a >300 s outage of any asset — in that case
-split the series at the gaps first and tell us.
+assets on a common 1 s clock and **stops on ANY flagged outage** (a gap longer than 300 s in any asset; there is no percentage tolerance). Split the series at the gaps first and tell us; do not work around it.
 
 ## 2. Smoke run (≈ minutes) — proves the pipeline end to end
 
@@ -117,3 +116,10 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 - FI-2010: `segment_lengths.json` must be verified against the source files; record file identity (names/hashes), day order, stock order, and confirm the split is train days 1-6, val day 7, test days 8-10.
 - Early-warning results now include `events_total/evaluable/censored`, `alarms`, `false_alarms`, `alarms_censored`, `exposure_rows`, and the policy (tau, refractory, renew_every). Report them as-is.
 - Report the actual epochs/updates executed for baselines and the hybrid, and paired segment-aware differences vs baselines.
+
+## Review-4 additions (remaining-changes list)
+- **Crypto split / scaler (`split_plan` in Exp C)**: scaler fits only on rows read as INPUT by train windows (`scaler_end`); label thresholds use only returns a train label reads (`label_support_end`); HORIZON windows are purged before each boundary. Val/test windows may read earlier rows as causal input context; that shared input history is reported, not counted as target leakage.
+- **ω supervision**: Stage B aligns ω to a TRAILING volatility flag, so ω is a current-regime / latent-flow diagnostic. Use "early warning" language only if `early_warning_study.py` (untouched forward targets, same alarm policy, vs rolling-vol baselines) supports it.
+- **Gate objective**: `--gate_objective legacy|benefit` (Exp B train). Run `routing_study.py` for BOTH and compare validation macro-F1 vs routed fraction against the confidence and rolling-vol cascades (threshold chosen on validation only). Keep `legacy` if `benefit` does not help.
+- **Live pipeline**: `python pipeline.py --omega_mode gated|always`. `gated` (default) = gate first; heavy path/ω only on routed ticks, otherwise ω is shown cached (with age) or unavailable and zero heavy calls are made. `always` = heavy every tick, NO compute-saving claim. `latency_ms` in the log is measured end-to-end per tick.
+- Presentation targets (FLOP reduction, F1, Sharpe, phase accuracy) are design targets, not results.
