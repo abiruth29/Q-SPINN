@@ -44,7 +44,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 
 from device import get_device
 from logger import ExperimentLogger
-from checkpoint import save_checkpoint, load_checkpoint, guard_nan
+from checkpoint import save_checkpoint, load_checkpoint, guard_nan, fingerprint_of, set_run_fingerprint
 from qspinn_core import (propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
                          StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
                          stage_c_mode, heavy_teacher_ctx, expert_benefit, benefit_gate_loss)
@@ -1019,6 +1019,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         epochs_c = EPOCHS_C if epochs_c is None else epochs_c
         batch_size = BATCH_SIZE if batch_size is None else batch_size
         out_dir = Path(out_dir) if out_dir else OUT_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
         run_name = run_name or f"k{horizon}_s{seed}"
 
     torch.manual_seed(seed); np.random.seed(seed)
@@ -1071,6 +1072,10 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         model = QSPINN().to(device)
         vp = None if segs["train"] is None else (segs["train"][1:] == segs["train"][:-1])   # no stock/day-join deltas
         model.encoder.fit(Xtr_np, valid_pair=vp)   # train-only thresholds, same encoder for val/test
+        set_run_fingerprint(fingerprint_of(exp="B", horizon=horizon, seed=seed, epochs=[epochs_a, epochs_b, epochs_c],
+                                           batch=batch_size, gate=gate_objective, legacy=bool(legacy_split),
+                                           n=[int(len(Xtr)), int(len(Xva)), int(len(Xte))],
+                                           head=float(np.round(float(Xtr[:200].double().sum()), 6))))
         ckpt = load_checkpoint(ckpt_path, log)
         current_stage = ckpt["stage"] if ckpt else None
         
@@ -1158,12 +1163,12 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     log.info(f"Model weights  → {weights_path}")
     
     # Also save to default path for standard single-asset compatibility
-    if horizon == 10 and seed == 0:
+    if horizon == 10 and seed == 0 and Path(out_dir) == OUT_DIR:     # canonical copies only for real (non-smoke) runs
         torch.save(model.state_dict(), OUT_DIR / "qspinn_fi2010.pt")
     from live_contract import make_contract, save_contract   # Task 17: record the input contract
     save_contract(out_dir / f"qspinn_fi2010_k{horizon}_s{seed}_contract.json",
                   make_contract(SEQ_LEN, N_FEATURES, "fi2010_authors", "dataset_zscore", "equity"))
-    if horizon == 10 and seed == 0:
+    if horizon == 10 and seed == 0 and Path(out_dir) == OUT_DIR:     # canonical copies only for real (non-smoke) runs
         save_contract(OUT_DIR / "qspinn_fi2010_contract.json",
                       make_contract(SEQ_LEN, N_FEATURES, "fi2010_authors", "dataset_zscore", "equity"))
 
@@ -1174,7 +1179,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     write_results(ablation_rows, m, timestamp, gpu_name, majority,
                   out_path=res_path, horizon=horizon, seed=seed,
                   epochs_tuple=(epochs_a, epochs_b, epochs_c))
-    if horizon == 10 and seed == 0:
+    if horizon == 10 and seed == 0 and Path(out_dir) == OUT_DIR:     # canonical copies only for real (non-smoke) runs
         write_results(ablation_rows, m, timestamp, gpu_name, majority,
                       out_path=OUT_DIR / "RESULTS.md", horizon=10, seed=0,
                       epochs_tuple=(epochs_a, epochs_b, epochs_c))

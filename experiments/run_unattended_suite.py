@@ -215,7 +215,12 @@ Validates cross-asset Magnetic Graph Laplacian coupling on Binance microstructur
     log(f"Master publication report updated → {MASTER_MD}")
 
 
+SMOKE_DIR = Path(__file__).resolve().parent / "_smoke"   # smoke runs never touch the real result folders
+ATTEMPTED: set = set()      # job ids this invocation actually ran or resumed (older failures are reported separately)
+
+
 def run_job(job_id: str, desc: str, fn, *args, **kwargs):
+    ATTEMPTED.add(job_id)
     state = load_state()
     from qspinn_core import PROTOCOL_VERSION
     old = state["jobs"].get(job_id, {})
@@ -312,7 +317,8 @@ def main():
         for k in horizons:
             for sd in seeds:
                 run_job(f"fi2010_k{k}_s{sd}", f"FI-2010 Setup 2, k={k}, seed {sd}",
-                        train_fi2010, horizon=k, seed=sd, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c)
+                        train_fi2010, horizon=k, seed=sd, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c,
+                        **({"out_dir": SMOKE_DIR / "exp_B"} if args.test else {}))
 
     if not args.skip_binance:
         # ── 5. Binance 3-Asset Basket (BTC, ETH, SOL with Magnetic Laplacian)
@@ -322,14 +328,16 @@ def main():
             "Binance 3-Asset Hybrid with Magnetic Graph Laplacian (BTC, ETH, SOL)",
             train_binance,
             epochs_a=binance_ep, epochs_b=binance_ep, epochs_c=binance_ep,
-            max_ticks=binance_ticks
+            max_ticks=binance_ticks,
+            **({"out_dir": SMOKE_DIR / "exp_C"} if args.test else {})
         )
 
     # ── 9. Final Master Report Generation ──────────────────────────────────
     state = load_state()
     jobs = state.get("jobs", {})
-    failed = sorted(j for j, v in jobs.items() if v.get("status") == "FAILED")
-    ok = sorted(j for j, v in jobs.items() if v.get("status") not in (None, "FAILED"))
+    failed = sorted(j for j, v in jobs.items() if v.get("status") == "FAILED" and j in ATTEMPTED)
+    ok = sorted(j for j, v in jobs.items() if v.get("status") not in (None, "FAILED") and j in ATTEMPTED)
+    stale_failed = sorted(j for j, v in jobs.items() if v.get("status") == "FAILED" and j not in ATTEMPTED)
     state["finished_at"] = datetime.now().isoformat()
     state["n_failed"] = len(failed)
     if not failed:
@@ -343,7 +351,9 @@ def main():
         log(f"     Succeeded: {', '.join(ok) if ok else 'none'}")
         log("     Read the error above/in the state file, fix the cause, then re-run (finished jobs are skipped).")
     else:
-        log(f"  ✅ ALL {len(ok)} SCHEDULED JOB(S) SUCCEEDED")
+        log(f"  ✅ ALL {len(ok)} JOB(S) RUN IN THIS INVOCATION SUCCEEDED")
+    if stale_failed:
+        log(f"  ℹ️  Earlier FAILED job(s) NOT run this time: {', '.join(stale_failed)}")
     log(f"  Master Report Available at: {MASTER_MD}")
     log("*" * 70)
     return 1 if failed else 0

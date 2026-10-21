@@ -65,3 +65,5 @@ Thumbs.db
 .vscode/
 .idea/
 experiments/suite_state*.json
+experiments/_smoke/
+experiments/**/checkpoint*.pt

@@ -142,3 +142,12 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 - **Binance data (Exp C).** If `data/curated/trades/symbol=BTCUSDT|ETHUSDT|SOLUSDT` is missing, Exp C now stops with a clear message; build it with `python procure_binance_data.py` first.
 - **Suite runner.** `run_unattended_suite.py` now lists failed jobs and exits with code 1 when any job failed. It only says "ALL … SUCCEEDED" when none failed.
 - **Windows.** All text reads/writes are explicitly UTF-8 (a test enforces this). GPU latency needs a CUDA machine: a CPU-only torch (e.g. 2.7.1+cpu) can only produce CPU numbers.
+
+## Review-8 additions (first Binance smoke run)
+- **Your first Binance smoke result is INVALID.** It resumed a `checkpoint.pt` that the unit tests had written into `experiments/exp_C_multi_asset_binance/` (a default-argument bug), so Stage A/B never ran and the weights came from synthetic test data. Fixed: checkpoints now carry a run fingerprint (config + data + epoch budget) and are refused on any mismatch; tests no longer write there; smoke runs write to `experiments/_smoke/` (git-ignored).
+- **Clean up before re-running** (Git Bash, repo root):
+  `rm -f experiments/exp_C_multi_asset_binance/checkpoint.pt experiments/exp_C_multi_asset_binance/qspinn_binance_multi_asset.pt experiments/checkpoint*.pt experiments/*/checkpoint*.pt`
+  `git checkout experiments/exp_C_multi_asset_binance/RESULTS.md experiments/TEST_PUBLICATION_RESULTS.md 2>/dev/null; git status`
+  and delete `experiments/state*.json` / suite state files if present (the runner will rebuild them).
+- Exp C now also reports a **past-return lookup baseline** (rule: sign/size of the last 5 s return -> train-majority label). The LSTM's ~0.57 accuracy on a balanced 3-class 5 s task is suspiciously high; a learned model's accuracy only counts as signal if it clearly beats this rule. Report both.
+- The suite summary only blames jobs run in the current invocation; older failures are listed as "not run this time".

@@ -97,3 +97,6 @@ Evidence-dependent (teammate): 06 verified FI segment metadata, 07 real-crypto o
 
 ## Review 7 (teammate's first Windows run)
 UTF-8 everywhere (AST test enforces it); suite runner reports failures + non-zero exit; Exp C missing-data error is actionable; `procure_fi2010 --setup2 --segments` checks the manifest before extracting the archive and explains where counts must come from. Open: obtain verified FI-2010 per-stock/day counts (not in the paper); obtain Binance history.
+
+## Review 8 (first Binance smoke run)
+Stale-checkpoint resume (tests polluting the real output dir via default-arg binding) fixed: call-time path resolution, run-fingerprint checkpoints (refuse mismatched config/data/epochs), smoke runs isolated in `experiments/_smoke/`, canonical Exp B copies only for real runs, tests verified not to touch real outputs. Added naive past-return lookup baseline to Exp C; suite summary scoped to attempted jobs. Data check: 30 days of Binance (Sep 2026), 0 outage seconds >300 s, stale-second share BTC 10.9% / ETH 24.5% / SOL 34.2%.

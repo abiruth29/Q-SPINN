@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 
 from device import get_device
 from logger import ExperimentLogger
-from checkpoint import save_checkpoint, load_checkpoint, guard_nan
+from checkpoint import save_checkpoint, load_checkpoint, guard_nan, fingerprint_of, set_run_fingerprint
 from qspinn_core import (expert_benefit, benefit_gate_loss, propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
                          StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
                          stage_c_mode, heavy_teacher_ctx)
@@ -592,7 +592,7 @@ def macro_f1(pred, true, n=3):
 
 
 # ── training stages ───────────────────────────────────────────────────────────
-def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_A, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
+def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_A, ckpt_path=None, batch_size=BATCH_SIZE):
     log.section(f"Stage A — SNN Gate Cheap Head ({epochs} epochs)")
     params = [p for n, p in model.named_parameters() if n.startswith("gate.") and "gate_head" not in n]
     opt = torch.optim.Adam(params, lr=LR)
@@ -601,6 +601,7 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
     cw = (cw / cw.sum() * 3.0).to(device)
     ce = nn.CrossEntropyLoss(weight=cw)
 
+    ckpt_path = CKPT_PATH if ckpt_path is None else ckpt_path   # resolved at CALL time (monkeypatch/out_dir safe)
     ckpt = load_checkpoint(ckpt_path, log)
     start_ep = ckpt["epoch"] if ckpt and ckpt.get("stage") == "A" else 0
     best = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "A" else -1.0
@@ -653,7 +654,7 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
     return model
 
 
-def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
+def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=None, batch_size=BATCH_SIZE):
     log.section(f"Stage B — Heavy Path (Magnetic Graph Laplacian + concurrent-regime ω alignment) ({epochs} epochs)")
     params_heavy = list(model.amp.parameters()) + list(model.ham.parameters()) + list(model.head.parameters())
     opt_heavy = torch.optim.Adam(params_heavy, lr=LR)
@@ -663,6 +664,7 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
     cw = (cw / cw.sum() * 3.0).to(device)
     ce = nn.CrossEntropyLoss(weight=cw)
 
+    ckpt_path = CKPT_PATH if ckpt_path is None else ckpt_path   # resolved at CALL time (monkeypatch/out_dir safe)
     ckpt = load_checkpoint(ckpt_path, log)
     start_ep = ckpt["epoch"] if ckpt and ckpt.get("stage") == "B" else 0
     best = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "B" else -1.0
@@ -718,7 +720,7 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
     return model
 
 
-def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE, gate_objective="legacy"):
+def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=None, batch_size=BATCH_SIZE, gate_objective="legacy"):
     log.section(f"Stage C — Multi-Asset Gate Arbitration ({epochs} epochs, objective={gate_objective})")
     gate_params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_regime]
     params = stage_c_mode(model, gate_params)   # Task 03
@@ -727,6 +729,7 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
     ce  = nn.CrossEntropyLoss()
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
 
+    ckpt_path = CKPT_PATH if ckpt_path is None else ckpt_path   # resolved at CALL time (monkeypatch/out_dir safe)
     ckpt = load_checkpoint(ckpt_path, log)
     start_ep = ckpt["epoch"] if ckpt and ckpt.get("stage") == "C" else 0
     best_score = ckpt.get("best_f1", -1e9) if ckpt and ckpt.get("stage") == "C" else -1e9
@@ -885,7 +888,10 @@ def train_lstm(Xtr, ytr, Xva, yva, device, epochs=15):
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
-def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy"):
+def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy", out_dir=None):
+    global OUT_DIR, CKPT_PATH
+    if out_dir is not None:                       # smoke/trial runs must never touch the real output folder
+        OUT_DIR = Path(out_dir); OUT_DIR.mkdir(parents=True, exist_ok=True); CKPT_PATH = OUT_DIR / "checkpoint.pt"
     torch.manual_seed(SEED); np.random.seed(SEED)
     log = ExperimentLogger(OUT_DIR / "train.log", experiment_name="Exp C — 3-Asset Binance Basket")
     device = get_device(verbose=True)
@@ -901,6 +907,13 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     log.metric("Test windows",  len(Xte))
     log.metric("Majority baseline", majority)
 
+    # Checkpoints resume ONLY for this exact configuration + data (review: smoke/test checkpoints must never leak in).
+    set_run_fingerprint(fingerprint_of(exp="C", n_rows=int(len(feats)), n_feat=int(feats.shape[1]),
+                                       head=float(np.round(np.asarray(feats[:2000], dtype=np.float64).sum(), 6)),
+                                       tail=float(np.round(np.asarray(feats[-2000:], dtype=np.float64).sum(), 6)),
+                                       seq=SEQ_LEN, horizon=HORIZON, tf=TRAIN_FRAC, vf=VAL_FRAC, seed=SEED,
+                                       epochs=[epochs_a, epochs_b, epochs_c], max_ticks=max_ticks,
+                                       batch=batch_size, gate=gate_objective))
     model = MultiAssetQSPINN(n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS).to(device)
     # Task 04: encoder thresholds from TRAIN rows only (windows have stride 1 -> rebuild the row series)
     model.encoder.fit(torch.cat([Xtr[:, 0], Xtr[-1, 1:]]).numpy())
@@ -928,6 +941,11 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
             lstm_preds.append(lstm(Xb).argmax(1).cpu())
     p = torch.cat(lstm_preds)
     ablation_rows.append(("LSTM baseline", (p == yte.cpu()).float().mean().item(), macro_f1(p, yte.cpu()), float('nan'), float('nan'), float('nan'), float('nan')))
+
+    from baselines import past_return_lookup
+    nb_acc, nb_f1, nb_table = past_return_lookup(Xtr, ytr, Xte, yte, k=5, ret_idx=0)
+    log.info(f"Past-return lookup (microstructure baseline) bin->class table: {nb_table}")
+    ablation_rows.append(("Past-return lookup (naive)", nb_acc, nb_f1, float('nan'), float('nan'), float('nan'), float('nan')))
 
     m_cheap = evaluate_binance(model, Xte, yte, rte, dt_te, mode="cheap")
     ablation_rows.append(("SNN only (cheap)", m_cheap["acc"], m_cheap["f1"], 0.0, m_cheap["herm"], m_cheap["omega"], m_cheap["crash_P"]))
