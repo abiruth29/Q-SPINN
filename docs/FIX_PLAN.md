@@ -91,3 +91,6 @@ Evidence-dependent (teammate): 06 verified FI segment metadata, 07 real-crypto o
 
 ## Review 5 (v3.1.2 recheck) — implemented
 01 presentation 99%/1% tick claims removed (both decks). 02 integrated-ω display replaced by sample-based `omega_fresh_mean`. 03 lean `heavy_infer(return_omega=True)` used live (parity-tested vs `heavy_path`). 04 pyarrow installed, full suite 0 skipped, log in `docs/TEST_LOG_latest.txt`. 05 benefit-vs-legacy default decision awaits teammate's routing study. 06–10 remain external (verified FI segments, real crypto outages + live contract, controlled studies, held-out warning evaluation, live market-specific training).
+
+## Review 6 (latest-archive recheck) — implemented
+01 reference doc §3 retired with a LEGACY/INVALID banner; unmeasured DeepLOB and compute claims removed. 02 event-driven live input (`DepthFreshness`), input age + `pred` logged, `cadence` in the input contract; tests for consecutive no-depth ticks, throttling, event gaps, record == live_step. 03 `scripts/release_check.sh` + `QSPINN_REQUIRE_FULL=1` (skips fail) + `requirements-lock.txt`; 116 passed, 0 skipped locally. 04–09 remain data/experiment-dependent (FI segment audit, real crypto validation, benefit-vs-legacy study, controlled benchmarks, held-out warning study, target-market live model).

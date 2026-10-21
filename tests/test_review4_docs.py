@@ -36,3 +36,11 @@ def test_no_numerical_tick_proportion_facts_in_presentations():
         t = _text(p)
         for bad in ("~99% noise", "~99% ticks", "~1% ticks"):
             assert bad not in t, (p, bad)
+
+
+def test_reference_document_is_clearly_retired():
+    t = _text(ROOT / "Q_SPINN_COMPLETE_REFERENCE_DOCUMENT.md")
+    assert t.lstrip().startswith("> **SUPERSEDED")
+    assert "LEGACY / INVALID" in t and "DO NOT CITE" in t
+    assert "~93% compute reduction" not in t.replace("the \"~93% compute reduction\" claim were removed", "")
+    assert "~0.570" not in t.replace('("~0.570/0.590/0.610")', "")

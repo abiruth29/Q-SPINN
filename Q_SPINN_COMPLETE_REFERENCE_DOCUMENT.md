@@ -149,20 +149,23 @@ $$i \hbar \frac{d\Psi}{dt} = \left( L_{\Phi} \otimes I_d + H_{\text{local}} \rig
 
 ## 3. Empirical Results & Benchmark Tables
 
-### 3.1 Multi-Horizon Benchmark on FI-2010 (Section 25)
+> ## ⛔ LEGACY / INVALID — DO NOT CITE
+> Every table and statement in Section 3 was produced under the pre-v3.1 protocol (concatenated-fold split, non-causal residuals, unverified baselines, heuristic compute accounting) and is **retracted**. It is kept only as a historical record of what the old code printed. It is **not evidence** that Q-SPINN beats DeepLOB, saves compute, predicts crashes, or finds lead-lag. The DeepLOB figures below were never measured under a matched protocol. Current status and required evidence: README.md and docs/FIX_PLAN.md.
+
+### 3.1 [LEGACY — INVALID] Multi-Horizon Benchmark on FI-2010 (Section 25)
 Standard evaluation on the canonical FI-2010 benchmark (Folds 1–7 Train, Fold 8 Val, Fold 9 Test) across 2,045,191 order book events:
 
-| Prediction Horizon | Accuracy | **Macro-F1** | DeepLOB Baseline (Zhang et al.) | **F1 Gain vs. DeepLOB** | Gate Rate (Compute Load) | $\omega(A_t)$ (EWS Margin) | Crash Prob ($\omega > 0$) | Majority Baseline |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **$k=10$ ticks** | **80.4%** | **0.746** | ~0.570 | **+17.6%** | 10.0% | `-0.0062` | 19.3% | 0.642 |
-| **$k=20$ ticks** | **71.1%** | **0.679** | ~0.590 | **+8.9%** | 10.4% | `-0.0019` | 24.9% | 0.541 |
-| **$k=50$ ticks** | **79.7%** | **0.794** | ~0.610 | **+18.4%** | **5.3%** 🚀 | `-0.0125` | 14.4% | 0.374 |
+| Prediction Horizon | Accuracy (legacy) | Macro-F1 (legacy) | Gate Rate (legacy, uncalibrated) | Majority Baseline |
+| :---: | :---: | :---: | :---: | :---: |
+| k=10 | 80.4% | 0.746 | 10.0% | 0.642 |
+| k=20 | 71.1% | 0.679 | 10.4% | 0.541 |
+| k=50 | 79.7% | 0.794 | 5.3% | 0.374 |
 
-*Key Scientific Takeaway:* Across all horizons, Q-SPINN outperforms the standard deep learning baseline (DeepLOB) by **+8.9% to +18.4% in Macro-F1**, while achieving an average **~93% compute reduction** through sparse event-driven routing.
+*Retracted:* the DeepLOB comparison ("~0.570/0.590/0.610"), the "F1 gain vs. DeepLOB", the ω/"crash probability" columns, and the "~93% compute reduction" claim were removed. DeepLOB was not run under a matched protocol, ω is a latent-flow diagnostic and not a crash probability, and no wall-clock compute saving has been measured.
 
 ---
 
-### 3.2 Multi-Seed Statistical Significance (SWAP-12, k=10)
+### 3.2 [LEGACY — INVALID] Multi-Seed Statistical Significance (SWAP-12, k=10)
 Validation across independent random weight initializations and mini-batch permutations ($k=10$ horizon):
 
 | Run | Accuracy | Macro-F1 | Gate Rate | $\omega(A_t)$ | Crash Prob | Status |
@@ -176,7 +179,7 @@ Validation across independent random weight initializations and mini-batch permu
 
 ---
 
-### 3.3 Comprehensive Ablation Breakdown
+### 3.3 [LEGACY — INVALID] Comprehensive Ablation Breakdown
 Ablation analysis on the FI-2010 test set (Fold 9, 354,805 windows):
 
 | Model Variant | Accuracy | Macro-F1 | Gate Rate | Hermiticity $\|H-H^\dagger\|$ | $\omega(A_t)$ | Crash Prob |
@@ -189,7 +192,7 @@ Ablation analysis on the FI-2010 test set (Fold 9, 354,805 windows):
 
 ---
 
-### 3.4 Binance 3-Asset Crypto Basket & Empirical Lead-Lag Discovery
+### 3.4 [LEGACY — INVALID] Binance 3-Asset Crypto Basket & Empirical Lead-Lag Discovery
 Evaluation on decentralized 1-second order flow across BTC/USDT, ETH/USDT, and SOL/USDT (350,000 bins, 18 features):
 
 | Architecture | Accuracy | Macro-F1 | Gate Rate | Van Loan Hermiticity | Status |

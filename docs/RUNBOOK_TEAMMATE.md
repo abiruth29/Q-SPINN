@@ -129,3 +129,9 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 - The live log reports `omega_fresh_mean` / `n_fresh_readings` (mean of recent FRESH ω readings). It is NOT a time integral.
 - Please also measure CPU/GPU wall-clock latency (gated vs always, several routing budgets) and record hardware + package versions with the results; `docs/TEST_LOG_latest.txt` shows the format.
 - Presentations no longer state tick-proportion numbers (99%/1%) as facts; re-add only a number measured on the corrected dataset, with its source.
+
+## Review-6 additions
+- **Release test run**: `bash scripts/release_check.sh` (installs requirements, runs pytest with `QSPINN_REQUIRE_FULL=1`, so ANY skip is a failure, and writes `docs/TEST_LOG_latest.txt` with package versions and hardware). `requirements-lock.txt` lists the versions the supplied log was produced with. Send me the generated log from YOUR machine.
+- **Live input freshness**: a window step/inference now happens only after a NEW BTC depth update (`DepthFreshness`); trade-only ticks and feed gaps never re-push stale features, and every log record carries `pred`, `input_age_s`, `omega_status`, `heavy_calls`, `latency_ms`. The input contract has a `cadence` key (`new_depth_throttled_2hz` live vs `event_rows` for FI-2010); a model is production-eligible only if it was trained on the same cadence, otherwise the pipeline stays DEMONSTRATION-only.
+- **Reference document**: `Q_SPINN_COMPLETE_REFERENCE_DOCUMENT.md` section 3 is now labelled LEGACY / INVALID; the unmeasured DeepLOB comparison and the "93% compute reduction" claim were removed.
+- For `segment_audit.json` (FI-2010): record per-stock/day counts, file hashes and ordering evidence; every segment must be validated against the source records.

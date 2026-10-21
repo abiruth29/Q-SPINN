@@ -14,14 +14,15 @@ from ingestor import stream_live
 from exp_B_hybrid_fi2010.train import QSPINN, N_ASSETS
 
 from lob_extractor import FI2010Extractor
-from live_contract import make_contract, load_contract, contracts_match, LiveWindow, OmegaState, live_step, FreshOmegaSummary
+from live_contract import make_contract, load_contract, contracts_match, LiveWindow, OmegaState, live_step, FreshOmegaSummary, DepthFreshness, make_log_record
 from exp_B_hybrid_fi2010.train import SEQ_LEN, N_FEATURES
 
 # Initialize the Q-SPINN.  Order matters (review item 10): decide on the input/protocol contract BEFORE loading
 # any tensors, and never load legacy weights into the current architecture.
 device = 'cpu'     # forced to CPU for live inference to prevent background CUDA context crashes
 ckpt_path = ROOT / "experiments" / "exp_B_hybrid_fi2010" / "qspinn_fi2010.pt"
-LIVE_CONTRACT = make_contract(SEQ_LEN, N_FEATURES, "binance_depth_extractor", "online_zscore", "crypto")
+LIVE_CONTRACT = make_contract(SEQ_LEN, N_FEATURES, "binance_depth_extractor", "online_zscore", "crypto",
+                              cadence="new_depth_throttled_2hz")
 TRAIN_CONTRACT = load_contract(ckpt_path.with_name("qspinn_fi2010_contract.json"))
 CONTRACT_OK, CONTRACT_MISMATCH = contracts_match(TRAIN_CONTRACT, LIVE_CONTRACT)
 MODE = "PRODUCTION" if CONTRACT_OK else "DEMONSTRATION (weights not trained on this input contract)"
@@ -46,7 +47,6 @@ omega_state = OmegaState()
 OMEGA_MODE = "gated"     # set from --omega_mode in main()
 
 LOG_FILE = ROOT / "live_inference.jsonl"
-last_write = time.time()
 
 # Store last seen prices and order books
 prices = {"btc": 64000.0, "eth": 3500.0, "sol": 150.0}
@@ -54,10 +54,10 @@ extractors = {"btc": FI2010Extractor(), "eth": FI2010Extractor(), "sol": FI2010E
 latest_features = {"btc": np.zeros(144), "eth": np.zeros(144), "sol": np.zeros(144)}
 
 from collections import deque
+freshness = DepthFreshness(throttle_s=0.5)   # one window step per NEW btc depth update; never re-push stale features
 omega_summary = FreshOmegaSummary(600)   # last up-to-600 FRESH omega readings (sample-based; NOT a fixed time window)
 
 async def process_tick(stream_name, payload):
-    global last_write
     
     symbol = ""
     if 'btc' in stream_name: symbol = "btc"
@@ -78,11 +78,14 @@ async def process_tick(stream_name, payload):
         feats = extractors[symbol].update_and_extract(bids, asks)
         if feats is not None:
             latest_features[symbol] = feats
-        
-    # Throttle inference and logging to 2 Hz so we don't overwhelm the dashboard file
-    if time.time() - last_write < 0.5:
+            if symbol == "btc":
+                freshness.mark_depth(time.time())
+
+    # Event-driven: only a NEW btc depth update may trigger a window step / inference (trade-only ticks and feed
+    # gaps cannot re-push stale features); additionally throttled to 2 Hz for the dashboard file.
+    ok, _reason, input_age_s = freshness.take(time.time())
+    if not ok:
         return
-    last_write = time.time()
     
     # Task 17: fixed-length window identical to training (no duplicate padding); wait until it is full
     window.push(latest_features["btc"])
@@ -98,22 +101,8 @@ async def process_tick(stream_name, payload):
         omega_summary.add(r["omega"])
     omega_fresh_mean = omega_summary.mean      # mean of recent FRESH readings (None until the first one)
 
-    data = {
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "mode": MODE,
-        "omega": r["omega"],
-        "omega_status": r["omega_status"],
-        "omega_age_ticks": r["omega_age_ticks"],
-        "omega_mode": r["omega_mode"],
-        "routed": r["routed"],
-        "heavy_calls": r["heavy_calls"],
-        "latency_ms": r["latency_ms"],
-        "omega_fresh_mean": omega_fresh_mean,
-        "n_fresh_readings": omega_summary.n,
-        "BTC": prices["btc"],
-        "ETH": prices["eth"],
-        "SOL": prices["sol"]
-    }
+    data = make_log_record(r, now_str=datetime.now().strftime("%H:%M:%S"), mode=MODE, input_age_s=input_age_s,
+                           prices=prices, summary=omega_summary)
     
     # Write to log for dashboard to read
     with open(LOG_FILE, "a") as f:

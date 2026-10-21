@@ -67,3 +67,51 @@ def test_dashboard_and_pipeline_no_longer_claim_integral():
     for f in ("pipeline.py", "dashboard.py"):
         t = (root / f).read_text()
         assert "Omega_T" not in t and "Integrated Abscissa" not in t, f
+
+
+# ── review 6 item 2: event-driven freshness + faithful log record ─────────────
+def test_trade_only_ticks_never_trigger_inference():
+    from live_contract import DepthFreshness
+    f = DepthFreshness(0.5)
+    f.mark_depth(100.0)
+    assert f.take(100.6)[0] is True                       # the new depth is consumed once
+    for t in (101.0, 102.0, 105.0):                       # consecutive ticks without new depth (trade-only / gap)
+        ok, reason, age = f.take(t)
+        assert ok is False and reason == "no_new_depth" and age is None
+    assert f.skipped["no_new_depth"] == 3
+
+
+def test_throttled_depth_stays_pending_and_reports_age():
+    from live_contract import DepthFreshness
+    f = DepthFreshness(0.5)
+    f.mark_depth(10.0); assert f.take(10.1)[0]
+    f.mark_depth(10.2)
+    assert f.take(10.3) == (False, "throttled", None)     # too soon, but the update is not lost
+    ok, reason, age = f.take(10.7)
+    assert ok and reason == "ok" and abs(age - 0.5) < 1e-9
+
+
+def test_event_gap_then_new_depth_reports_old_age_not_fresh():
+    from live_contract import DepthFreshness
+    f = DepthFreshness(0.5)
+    f.mark_depth(0.0); assert f.take(0.6)[0]
+    f.mark_depth(30.0)                                    # feed returns after a gap
+    ok, _, age = f.take(31.0)
+    assert ok and abs(age - 1.0) < 1e-9                   # age is relative to THIS depth update
+
+
+def test_log_record_matches_live_step():
+    from live_contract import FreshOmegaSummary, make_log_record
+    m = _model(); _force_gate(m, True); st = OmegaState(); x, dt = _x(); summ = FreshOmegaSummary()
+    r = live_step(m, x, dt, st, "gated"); summ.add(r["omega"])
+    rec = make_log_record(r, now_str="00:00:00", mode="DEMO", input_age_s=0.2,
+                          prices=dict(btc=1.0, eth=2.0, sol=3.0), summary=summ)
+    assert rec["pred"] == r["pred"] and rec["omega"] == r["omega"] and rec["routed"] == r["routed"]
+    assert rec["omega_status"] == "fresh" and rec["input_age_s"] == 0.2 and rec["n_fresh_readings"] == 1
+
+
+def test_contract_includes_cadence_and_mismatch_is_detected():
+    from live_contract import make_contract, contracts_match
+    a = make_contract(20, 144, "x", "y", "crypto"); b = make_contract(20, 144, "x", "y", "crypto", cadence="new_depth_throttled_2hz")
+    ok, bad = contracts_match(a, b)
+    assert not ok and bad == ["cadence"]

@@ -16,13 +16,16 @@ from pathlib import Path
 
 import numpy as np
 
-CONTRACT_KEYS = ("seq_len", "n_features", "feature_source", "normalisation", "market", "protocol")
+CONTRACT_KEYS = ("seq_len", "n_features", "feature_source", "normalisation", "market", "protocol", "cadence")
 
 
-def make_contract(seq_len: int, n_features: int, feature_source: str, normalisation: str, market: str) -> dict:
+def make_contract(seq_len: int, n_features: int, feature_source: str, normalisation: str, market: str,
+                  cadence: str = "event_rows") -> dict:
+    """`cadence` = what one window step is: FI-2010 'event_rows' (one LOB event per row) vs live
+    'new_depth_throttled_2hz' (one step per NEW depth update; trade-only/stale ticks never add a step)."""
     from qspinn_core import PROTOCOL_VERSION
     return dict(seq_len=seq_len, n_features=n_features, feature_source=feature_source,
-                normalisation=normalisation, market=market, protocol=PROTOCOL_VERSION)
+                normalisation=normalisation, market=market, protocol=PROTOCOL_VERSION, cadence=cadence)
 
 
 def save_contract(path: Path, contract: dict) -> None:
@@ -130,3 +133,40 @@ class FreshOmegaSummary:
     @property
     def mean(self):
         return (sum(self.buf) / len(self.buf)) if self.buf else None
+
+
+class DepthFreshness:
+    """
+    Event-driven live input gate (review 6, item 2).  A window step / inference is allowed ONLY after a NEW depth
+    update for the driving asset arrived; trade-only ticks, repeated throttle intervals and feed gaps never
+    re-push stale features.  `take()` also reports the age of the depth snapshot being used.
+    """
+    def __init__(self, throttle_s: float = 0.5):
+        self.throttle_s = throttle_s
+        self.last_depth_t = None
+        self.pending = False
+        self.last_taken_t = -1e18
+        self.skipped = dict(no_new_depth=0, throttled=0)
+
+    def mark_depth(self, t: float):
+        self.last_depth_t, self.pending = float(t), True
+
+    def take(self, now: float):
+        """-> (ok, reason, input_age_s).  ok=True consumes the pending depth update."""
+        if not self.pending:
+            self.skipped["no_new_depth"] += 1
+            return False, "no_new_depth", None
+        if now - self.last_taken_t < self.throttle_s:
+            self.skipped["throttled"] += 1            # stays pending: will be used on the next allowed tick
+            return False, "throttled", None
+        self.pending = False; self.last_taken_t = float(now)
+        return True, "ok", float(now - self.last_depth_t)
+
+
+def make_log_record(r: dict, *, now_str: str, mode: str, input_age_s: float, prices: dict, summary) -> dict:
+    """The JSON record written for the dashboard: it carries exactly what live_step returned (incl. pred)."""
+    return {"time": now_str, "mode": mode, "pred": r["pred"], "omega": r["omega"], "omega_status": r["omega_status"],
+            "omega_age_ticks": r["omega_age_ticks"], "omega_mode": r["omega_mode"], "routed": r["routed"],
+            "heavy_calls": r["heavy_calls"], "latency_ms": r["latency_ms"], "input_age_s": input_age_s,
+            "omega_fresh_mean": summary.mean, "n_fresh_readings": summary.n,
+            "BTC": prices["btc"], "ETH": prices["eth"], "SOL": prices["sol"]}
