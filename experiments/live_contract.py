@@ -29,12 +29,12 @@ def make_contract(seq_len: int, n_features: int, feature_source: str, normalisat
 
 
 def save_contract(path: Path, contract: dict) -> None:
-    Path(path).write_text(json.dumps(contract, indent=2))
+    Path(path).write_text(json.dumps(contract, indent=2), encoding="utf-8")
 
 
 def load_contract(path: Path) -> dict | None:
     p = Path(path)
-    return json.loads(p.read_text()) if p.exists() else None
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
 def contracts_match(train: dict | None, live: dict) -> tuple[bool, list]:

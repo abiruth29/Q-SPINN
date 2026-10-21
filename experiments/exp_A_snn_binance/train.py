@@ -561,7 +561,7 @@ def main():
     torch.save(model.state_dict(), OUT_DIR / "snn_binance.pt")
     log.info(f"Model weights  → {OUT_DIR / 'snn_binance.pt'}")
 
-    with open(OUT_DIR / "results.json", "w") as f:
+    with open(OUT_DIR / "results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     log.info(f"Results JSON   → {OUT_DIR / 'results.json'}")
 

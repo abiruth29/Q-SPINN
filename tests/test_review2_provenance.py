@@ -11,12 +11,12 @@ def test_stale_completed_job_is_retrained(tmp_path, monkeypatch):
     R = importlib.import_module("run_unattended_suite")
     monkeypatch.setattr(R, "STATE_FILE", tmp_path / "state.json"); monkeypatch.setattr(R, "MASTER_MD", tmp_path / "m.md")
     (tmp_path / "state.json").write_text(json.dumps({"jobs": {"fi2010_k10_s0": {
-        "status": "COMPLETED", "metrics": {"macro_f1": 0.745664}}}}))      # legacy: no protocol field
+        "status": "COMPLETED", "metrics": {"macro_f1": 0.745664}}}}), encoding="utf-8")      # legacy: no protocol field
     called = []
     out = R.run_job("fi2010_k10_s0", "x", lambda: called.append(1) or {"macro_f1": 0.5, "accuracy": .5, "gate_rate": .1,
                     "hermiticity": 0., "omega": 0., "crash_p": 0., "majority": .5})
     assert called and out["macro_f1"] == 0.5
-    assert json.loads((tmp_path / "state.json").read_text())["jobs"]["fi2010_k10_s0"]["protocol"] == PROTOCOL_VERSION
+    assert json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))["jobs"]["fi2010_k10_s0"]["protocol"] == PROTOCOL_VERSION
     # same protocol -> skipped
     called.clear(); R.run_job("fi2010_k10_s0", "x", lambda: called.append(1)); assert not called
 
@@ -26,7 +26,7 @@ def test_master_report_ignores_legacy_jobs(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "MASTER_MD", tmp_path / "m.md")
     R.generate_master_report({"jobs": {"fi2010_k10_s0": {"status": "COMPLETED", "metrics": {
         "accuracy": .8, "macro_f1": .745664, "gate_rate": .1, "hermiticity": 0, "omega": 0, "crash_p": 0, "majority": .6}}}})
-    assert "0.746" not in (tmp_path / "m.md").read_text()
+    assert "0.746" not in (tmp_path / "m.md").read_text(encoding="utf-8")
 
 
 def test_legacy_checkpoint_rejected(tmp_path):

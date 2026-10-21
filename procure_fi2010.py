@@ -8,7 +8,20 @@ from pathlib import Path
 REFERENCE_DIR = Path("data/reference/fi2010")
 ZIP_PATH = REFERENCE_DIR / "BenchmarkDatasets.zip"
 
+def _require_manifest(segments):
+    if segments and not Path(segments).exists():
+        raise SystemExit(
+            f"segment manifest not found: {segments}\n"
+            "This file is NOT shipped with the repo: it must contain the VERIFIED row count of every stock/day segment,\n"
+            "format {\"train\": [42 counts], \"test_d8\": [5], \"test_d9\": [5], \"test_d10\": [5]}, each list summing to the\n"
+            "row count of its source file. The FI-2010 paper (arXiv 1705.03233) does NOT publish per-stock/day counts;\n"
+            "look in the dataset README from the paper's footnote-4 link, or ask the dataset authors.\n"
+            "Exploration only (training will REFUSE the result):  python procure_fi2010.py --setup2 --allow-heuristic")
+
+
 def main(setup2=False, segments=None, allow_heuristic=False):
+    if setup2:
+        _require_manifest(segments)      # fail BEFORE extracting the 1.8 GB archive
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
     
     if not ZIP_PATH.exists():
@@ -111,6 +124,7 @@ def main(setup2=False, segments=None, allow_heuristic=False):
 
 def _build_setup2(temp_dir, segments=None, allow_heuristic=False):
     """Setup 2: Train CF7 once + Test CF7/8/9, with recovered stock/day segments (see experiments/fi2010_setup2.py)."""
+    _require_manifest(segments)
     sys.path.insert(0, str(Path(__file__).resolve().parent / "experiments"))
     import fi2010_setup2 as f2
     base = temp_dir / "BenchmarkDatasets" / "NoAuction" / "1.NoAuction_Zscore"
@@ -119,7 +133,7 @@ def _build_setup2(temp_dir, segments=None, allow_heuristic=False):
     tests = {name: read(base / "NoAuction_Zscore_Testing" / f"Test_Dst_NoAuction_ZScore_CF_{cf}.txt")
              for name, cf in f2.TEST_DAYS.items()}
     import json
-    lengths = json.loads(Path(segments).read_text()) if segments else None
+    lengths = json.loads(Path(segments).read_text(encoding="utf-8")) if segments else None
     frames = f2.build_setup2_frames(train, tests, segment_lengths=lengths, allow_heuristic=allow_heuristic)
     f2.save_setup2(frames, REFERENCE_DIR)
     for name, r in f2.audit(frames).items():

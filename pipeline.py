@@ -105,7 +105,7 @@ async def process_tick(stream_name, payload):
                            prices=prices, summary=omega_summary)
     
     # Write to log for dashboard to read
-    with open(LOG_FILE, "a") as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(data) + "\n")
         
 import argparse

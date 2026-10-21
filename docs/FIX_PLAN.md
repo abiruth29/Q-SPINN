@@ -94,3 +94,6 @@ Evidence-dependent (teammate): 06 verified FI segment metadata, 07 real-crypto o
 
 ## Review 6 (latest-archive recheck) — implemented
 01 reference doc §3 retired with a LEGACY/INVALID banner; unmeasured DeepLOB and compute claims removed. 02 event-driven live input (`DepthFreshness`), input age + `pred` logged, `cadence` in the input contract; tests for consecutive no-depth ticks, throttling, event gaps, record == live_step. 03 `scripts/release_check.sh` + `QSPINN_REQUIRE_FULL=1` (skips fail) + `requirements-lock.txt`; 116 passed, 0 skipped locally. 04–09 remain data/experiment-dependent (FI segment audit, real crypto validation, benefit-vs-legacy study, controlled benchmarks, held-out warning study, target-market live model).
+
+## Review 7 (teammate's first Windows run)
+UTF-8 everywhere (AST test enforces it); suite runner reports failures + non-zero exit; Exp C missing-data error is actionable; `procure_fi2010 --setup2 --segments` checks the manifest before extracting the archive and explains where counts must come from. Open: obtain verified FI-2010 per-stock/day counts (not in the paper); obtain Binance history.

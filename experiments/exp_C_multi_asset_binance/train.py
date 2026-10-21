@@ -469,8 +469,12 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
     """Raw per-second aggregates INDEXED BY UNIX SECOND (timestamps kept - Task 11)."""
     import pyarrow.parquet as pq   # lazy: unit tests don't need pyarrow
     import pandas as pd
-    files = sorted(symbol_dir.rglob("*.parquet"))
-    if not files: return None
+    files = sorted(symbol_dir.rglob("*.parquet")) if Path(symbol_dir).exists() else []
+    if not files:
+        raise FileNotFoundError(
+            f"No parquet trade files found under {symbol_dir}. Exp C needs the Binance trade history at "
+            f"{Path(symbol_dir).parent}/symbol=BTCUSDT|ETHUSDT|SOLUSDT/... Build it first with "
+            "`python procure_binance_data.py` (see docs/RUNBOOK_TEAMMATE.md, section 1).")
     all_second_dfs, ticks_so_far = [], 0
     for f in files:
         pf = pq.ParquetFile(f)
@@ -485,7 +489,8 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
         ticks_so_far += len(file_sec)
         if ticks_so_far >= max_ticks: break
 
-    if not all_second_dfs: return None
+    if not all_second_dfs:
+        raise ValueError(f"Parquet files under {symbol_dir} contained no usable trade rows.")
     return pd.concat(all_second_dfs).groupby(level=0).agg(_AGG_OPS).sort_index()
 
 

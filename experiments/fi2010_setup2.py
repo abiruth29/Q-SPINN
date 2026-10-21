@@ -130,7 +130,7 @@ def save_setup2(frames, out_dir: Path):
         df["row_in_partition"] = np.arange(len(df))
         parts.append(df)
     pd.concat(parts, ignore_index=True).to_parquet(out_dir / "fi2010_setup2.parquet", compression="zstd")
-    (out_dir / "segment_audit.json").write_text(json.dumps(audit(frames), indent=2))
+    (out_dir / "segment_audit.json").write_text(json.dumps(audit(frames), indent=2), encoding="utf-8")
 
 
 def load_setup2(path: Path, label_col: str, val_days: int = 1, allow_heuristic: bool = False):

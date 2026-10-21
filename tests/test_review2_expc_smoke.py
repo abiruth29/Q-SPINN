@@ -26,4 +26,4 @@ def test_expc_main_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "CKPT_PATH", tmp_path / "out" / "ckpt.pt"); (tmp_path / "out").mkdir()
     res = C.main(epochs_a=1, epochs_b=1, epochs_c=1, max_ticks=5000, batch_size=64)
     assert 0 <= res["acc"] <= 1 and "loop_flux" in res
-    assert "gauge-invariant" in (tmp_path / "out" / "RESULTS.md").read_text()
+    assert "gauge-invariant" in (tmp_path / "out" / "RESULTS.md").read_text(encoding="utf-8")

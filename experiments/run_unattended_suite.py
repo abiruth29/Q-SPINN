@@ -327,15 +327,27 @@ def main():
 
     # ── 9. Final Master Report Generation ──────────────────────────────────
     state = load_state()
-    state["completed_at"] = datetime.now().isoformat()
+    jobs = state.get("jobs", {})
+    failed = sorted(j for j, v in jobs.items() if v.get("status") == "FAILED")
+    ok = sorted(j for j, v in jobs.items() if v.get("status") not in (None, "FAILED"))
+    state["finished_at"] = datetime.now().isoformat()
+    state["n_failed"] = len(failed)
+    if not failed:
+        state["completed_at"] = state["finished_at"]
     save_state(state)
     generate_master_report(state)
 
     log("*" * 70)
-    log("  🎉 ALL SCHEDULED EXPERIMENTS COMPLETED UNINTERRUPTED!")
+    if failed:
+        log(f"  ❌ SUITE FINISHED WITH {len(failed)} FAILED JOB(S): {', '.join(failed)}")
+        log(f"     Succeeded: {', '.join(ok) if ok else 'none'}")
+        log("     Read the error above/in the state file, fix the cause, then re-run (finished jobs are skipped).")
+    else:
+        log(f"  ✅ ALL {len(ok)} SCHEDULED JOB(S) SUCCEEDED")
     log(f"  Master Report Available at: {MASTER_MD}")
     log("*" * 70)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -34,7 +34,7 @@ def get_latest_inference():
     if log_file.exists():
         try:
             # Read the last line of the live inference stream
-            with open(log_file, "r") as f:
+            with open(log_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 if lines:
                     return json.loads(lines[-1])

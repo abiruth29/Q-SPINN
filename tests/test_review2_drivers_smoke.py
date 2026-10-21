@@ -35,12 +35,12 @@ def test_routing_and_early_warning_drivers_run(env, monkeypatch):
         monkeypatch.setattr(m, "HERE", tmp)
         monkeypatch.setattr(sys, "argv", [script, "--horizon", "10", "--seed", "0", "--weights", str(w)])
         m.main()
-        rep = json.loads((tmp / out).read_text())
+        rep = json.loads((tmp / out).read_text(encoding="utf-8"))
         assert rep
-    r = json.loads((tmp / "routing_study_k10_s0.json").read_text())
+    r = json.loads((tmp / "routing_study_k10_s0.json").read_text(encoding="utf-8"))
     assert set(r["routers"]) == {"learned_gate", "confidence_cascade", "rolling_vol", "benefit_head", "random"}
     lat = r["latency"]
     assert lat["dense_heavy_s"] > 0 and lat["cheap_only_s"] > 0 and set(lat["hybrid_at_fraction_s"]) == {"0.0", "0.1", "0.25", "0.5", "1.0"}
     assert lat["hybrid_at_fraction_s"]["0.0"] < lat["hybrid_at_fraction_s"]["1.0"]      # skipping the heavy expert is cheaper
-    e = json.loads((tmp / "early_warning_k10_s0.json").read_text())
+    e = json.loads((tmp / "early_warning_k10_s0.json").read_text(encoding="utf-8"))
     assert {"omega", "rolling_vol", "event_definition"} <= set(e) and "false_alarms" in e["omega"]

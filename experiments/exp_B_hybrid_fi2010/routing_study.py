@@ -115,7 +115,7 @@ def main():
     lat["hybrid_learned_gate_s"] = R.timed(lambda: run("hybrid"), device=device)
     lat["hybrid_at_fraction_s"] = {str(f): R.timed(lambda f=f: run("hybrid", f), device=device) for f in (0.0, 0.1, 0.25, 0.5, 1.0)}
     report["latency"] = lat
-    out.write_text(json.dumps(report, indent=2)); log.info(f"wrote {out}")
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8"); log.info(f"wrote {out}")
 
 
 if __name__ == "__main__":

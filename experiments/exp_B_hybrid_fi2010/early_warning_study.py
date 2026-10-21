@@ -100,7 +100,7 @@ def main():
                                                  "whose lead/follow window leaves that set are censored, not counted",
                                    false_alarms_per_unit_time="per 1000 eligible rows (not per hour)")
     out = HERE / f"early_warning_k{a.horizon}_s{a.seed}.json"
-    out.write_text(json.dumps(res, indent=2)); log.info(f"wrote {out}")
+    out.write_text(json.dumps(res, indent=2), encoding="utf-8"); log.info(f"wrote {out}")
 
 
 if __name__ == "__main__":

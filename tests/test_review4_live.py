@@ -65,7 +65,7 @@ def test_dashboard_and_pipeline_no_longer_claim_integral():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     for f in ("pipeline.py", "dashboard.py"):
-        t = (root / f).read_text()
+        t = (root / f).read_text(encoding="utf-8")
         assert "Omega_T" not in t and "Integrated Abscissa" not in t, f
 
 
