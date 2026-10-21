@@ -954,7 +954,7 @@ Three-stage training was used:
 - `‖H − H†‖` is zero because H is *constructed* Hermitian; it checks the code path, it is not an empirical result.
 - The gate rate is the **global** share of test windows routed to the heavy expert. It is a budget statistic, not a
   compute saving: measured latency is reported separately by `routing_study.py`.
-- $\omega(A_t)=\lambda_{\max}(S)$ is a latent-flow diagnostic. Whether it forecasts instability is decided only by
+- $\omega(A_t)=\lambda_{{\max}}(S)$ is a latent-flow diagnostic. Whether it forecasts instability is decided only by
   `early_warning_study.py` against a rolling-volatility baseline.
 - Nothing in this file is a claim about trading performance.
 """
