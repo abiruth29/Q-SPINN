@@ -142,12 +142,12 @@ with chart_col2:
         fillcolor='rgba(255, 0, 0, 0.1)',
         yaxis="y1"
     ))
-    if 'Omega_T' in df.columns:
+    if 'omega_fresh_mean' in df.columns:
         fig_line.add_trace(go.Scatter(
             x=df['time'], 
-            y=df['Omega_T'], 
+            y=df['omega_fresh_mean'], 
             mode='lines', 
-            name='Integrated Abscissa (Ω_T)', 
+            name='Mean of recent fresh ω (sample-based, not a time integral)', 
             line=dict(color='orange', width=2, dash='dot'),
             yaxis="y2"
         ))

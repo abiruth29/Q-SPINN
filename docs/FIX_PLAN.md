@@ -88,3 +88,6 @@ section of the project report (Chapter 7) that describes the problem.
 04. `live_step`: gate-first live inference; ω fresh/cached/unavailable; `--omega_mode`; end-to-end latency logged.
 05. Runbook/README/presentation synced; docs tests guard against stale claims.
 Evidence-dependent (teammate): 06 verified FI segment metadata, 07 real-crypto outage validation + live/train feature contract, 08 fresh weights + controlled studies, 09 warning-quality study on untouched forward targets.
+
+## Review 5 (v3.1.2 recheck) — implemented
+01 presentation 99%/1% tick claims removed (both decks). 02 integrated-ω display replaced by sample-based `omega_fresh_mean`. 03 lean `heavy_infer(return_omega=True)` used live (parity-tested vs `heavy_path`). 04 pyarrow installed, full suite 0 skipped, log in `docs/TEST_LOG_latest.txt`. 05 benefit-vs-legacy default decision awaits teammate's routing study. 06–10 remain external (verified FI segments, real crypto outages + live contract, controlled studies, held-out warning evaluation, live market-specific training).

@@ -102,9 +102,9 @@ def live_step(model, x, dt, state: OmegaState, omega_mode: str = "gated"):
         routed = True if omega_mode == "always" else bool(g[0] > 0.5)
         heavy_calls = 0
         if routed:
-            heavy, _, _, S, _, _ = model.heavy_path(x)
-            state.fresh(torch.linalg.eigvalsh(S)[:, -1].item())
-            logits = heavy; heavy_calls = 1; status = "fresh"
+            logits, om = model.heavy_infer(x, return_omega=True)     # lean: no PDE/norm/scale/prefix-residual work
+            state.fresh(om[0].item())
+            heavy_calls = 1; status = "fresh"
         else:
             state.stale()
             logits = cheap
@@ -112,3 +112,21 @@ def live_step(model, x, dt, state: OmegaState, omega_mode: str = "gated"):
     return dict(pred=int(logits.argmax(1)[0]), routed=routed, heavy_calls=heavy_calls,
                 omega=state.value, omega_status=status, omega_age_ticks=state.age if status != "fresh" else 0,
                 omega_mode=omega_mode, latency_ms=(_t.perf_counter() - t0) * 1e3)
+
+
+class FreshOmegaSummary:
+    """Sample-based summary of the most recent FRESH omega readings.  Deliberately NOT a time integral: in gated
+    mode fresh readings arrive irregularly, so sum*dt would be mathematically meaningless."""
+    def __init__(self, maxlen: int = 600):
+        self.buf = deque(maxlen=maxlen)
+
+    def add(self, v: float):
+        self.buf.append(float(v))
+
+    @property
+    def n(self) -> int:
+        return len(self.buf)
+
+    @property
+    def mean(self):
+        return (sum(self.buf) / len(self.buf)) if self.buf else None

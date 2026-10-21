@@ -123,3 +123,9 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 - **Gate objective**: `--gate_objective legacy|benefit` (Exp B train). Run `routing_study.py` for BOTH and compare validation macro-F1 vs routed fraction against the confidence and rolling-vol cascades (threshold chosen on validation only). Keep `legacy` if `benefit` does not help.
 - **Live pipeline**: `python pipeline.py --omega_mode gated|always`. `gated` (default) = gate first; heavy path/ω only on routed ticks, otherwise ω is shown cached (with age) or unavailable and zero heavy calls are made. `always` = heavy every tick, NO compute-saving claim. `latency_ms` in the log is measured end-to-end per tick.
 - Presentation targets (FLOP reduction, F1, Sharpe, phase accuracy) are design targets, not results.
+
+## Review-5 additions
+- Live ω now uses the lean `heavy_infer(x, return_omega=True)` (same logits and ω as `heavy_path`, no training losses); gated mode still makes zero heavy calls on unrouted ticks.
+- The live log reports `omega_fresh_mean` / `n_fresh_readings` (mean of recent FRESH ω readings). It is NOT a time integral.
+- Please also measure CPU/GPU wall-clock latency (gated vs always, several routing budgets) and record hardware + package versions with the results; `docs/TEST_LOG_latest.txt` shows the format.
+- Presentations no longer state tick-proportion numbers (99%/1%) as facts; re-add only a number measured on the corrected dataset, with its source.

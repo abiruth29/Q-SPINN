@@ -29,3 +29,10 @@ def test_runbook_states_current_policies():
     t = _text(ROOT / "docs" / "RUNBOOK_TEAMMATE.md")
     for must in ("ANY flagged outage", "gate_objective", "omega_mode", "split_plan"):
         assert must in t, must
+
+
+def test_no_numerical_tick_proportion_facts_in_presentations():
+    for p in ACTIVE[2:]:
+        t = _text(p)
+        for bad in ("~99% noise", "~99% ticks", "~1% ticks"):
+            assert bad not in t, (p, bad)

@@ -414,8 +414,9 @@ class QSPINN(nn.Module):
         return self.head(feats), L_pde, H_tot, S_tot, L_cov, L_norm
 
     @torch.no_grad()
-    def heavy_infer(self, x):
-        """Inference-only heavy expert: logits only - no residual generator, no PDE/norm/covariance work."""
+    def heavy_infer(self, x, return_omega=False):
+        """Inference-only heavy expert: logits only - no residual generator, no PDE/norm/covariance work.
+        return_omega=True also returns omega = lambda_max(S) from the SAME full-window generator (no extra losses)."""
         (H_tot, S_tot) = self.ham(x[:, 1:] - x[:, :-1])
         psi = self.amp(x)
         U = torch.matrix_exp((S_tot.to(torch.complex64) - 1j * H_tot) * DT)
@@ -424,7 +425,10 @@ class QSPINN(nn.Module):
         feats = torch.cat([ComplexAmplitudeLayer.density_features(psi_T),
                            ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),
                            ComplexAmplitudeLayer.density_features(psi_next)], dim=-1)
-        return self.head(feats)
+        logits = self.head(feats)
+        if return_omega:
+            return logits, torch.linalg.eigvalsh(S_tot)[:, -1]
+        return logits
 
     @torch.no_grad()
     def infer(self, spikes, x, dt_seq, chunk=4096, sel=None):

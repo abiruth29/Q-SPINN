@@ -14,7 +14,7 @@ def _x(): return torch.randn(1, B.SEQ_LEN, B.N_FEATURES), torch.ones(1, B.SEQ_LE
 
 
 class Count:
-    def __init__(self, m): self.n = 0; self.orig = m.heavy_path; m.heavy_path = self
+    def __init__(self, m): self.n = 0; self.orig = m.heavy_infer; m.heavy_infer = self
     def __call__(self, *a, **k): self.n += 1; return self.orig(*a, **k)
 
 
@@ -41,3 +41,29 @@ def test_always_mode_runs_heavy_every_tick():
     m = _model(); _force_gate(m, False); c = Count(m); st = OmegaState(); x, dt = _x()
     for _ in range(3): r = live_step(m, x, dt, st, "always")
     assert c.n == 3 and r["omega_status"] == "fresh" and r["omega_mode"] == "always" and r["latency_ms"] > 0
+
+
+def test_heavy_infer_matches_heavy_path_logits_and_omega():
+    m = _model(); x, _ = _x(); x = torch.randn(4, B.SEQ_LEN, B.N_FEATURES)
+    with torch.no_grad():
+        heavy, _, _, S, _, _ = m.heavy_path(x)
+        lg, om = m.heavy_infer(x, return_omega=True)
+    assert torch.allclose(lg, heavy, atol=1e-5) and torch.allclose(om, torch.linalg.eigvalsh(S)[:, -1], atol=1e-5)
+    assert torch.equal(m.heavy_infer(x), lg)
+
+
+def test_fresh_summary_is_sample_based_not_time_integral():
+    from live_contract import FreshOmegaSummary
+    a = FreshOmegaSummary(600); b = FreshOmegaSummary(600)
+    for v in (1.0, 3.0): a.add(v)                                  # two readings, one second apart
+    for v in (1.0, 3.0): b.add(v)                                  # same two readings, an hour apart
+    assert a.mean == b.mean == 2.0 and a.n == 2                    # depends on samples only; no dt anywhere
+    assert FreshOmegaSummary().mean is None
+
+
+def test_dashboard_and_pipeline_no_longer_claim_integral():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    for f in ("pipeline.py", "dashboard.py"):
+        t = (root / f).read_text()
+        assert "Omega_T" not in t and "Integrated Abscissa" not in t, f

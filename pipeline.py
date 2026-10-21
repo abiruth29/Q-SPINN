@@ -14,7 +14,7 @@ from ingestor import stream_live
 from exp_B_hybrid_fi2010.train import QSPINN, N_ASSETS
 
 from lob_extractor import FI2010Extractor
-from live_contract import make_contract, load_contract, contracts_match, LiveWindow, OmegaState, live_step
+from live_contract import make_contract, load_contract, contracts_match, LiveWindow, OmegaState, live_step, FreshOmegaSummary
 from exp_B_hybrid_fi2010.train import SEQ_LEN, N_FEATURES
 
 # Initialize the Q-SPINN.  Order matters (review item 10): decide on the input/protocol contract BEFORE loading
@@ -54,7 +54,7 @@ extractors = {"btc": FI2010Extractor(), "eth": FI2010Extractor(), "sol": FI2010E
 latest_features = {"btc": np.zeros(144), "eth": np.zeros(144), "sol": np.zeros(144)}
 
 from collections import deque
-omega_history = deque(maxlen=600)  # 5 minutes at 2Hz (dt=0.5s)
+omega_summary = FreshOmegaSummary(600)   # last up-to-600 FRESH omega readings (sample-based; NOT a fixed time window)
 
 async def process_tick(stream_name, payload):
     global last_write
@@ -95,8 +95,8 @@ async def process_tick(stream_name, payload):
     dt = torch.ones(1, SEQ_LEN, device=device)
     r = live_step(model, features, dt, omega_state, OMEGA_MODE)
     if r["omega_status"] == "fresh":
-        omega_history.append(r["omega"])
-    Omega_T = sum(omega_history) * 0.5          # integral over FRESH samples only (not time-uniform in gated mode)
+        omega_summary.add(r["omega"])
+    omega_fresh_mean = omega_summary.mean      # mean of recent FRESH readings (None until the first one)
 
     data = {
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -108,7 +108,8 @@ async def process_tick(stream_name, payload):
         "routed": r["routed"],
         "heavy_calls": r["heavy_calls"],
         "latency_ms": r["latency_ms"],
-        "Omega_T": Omega_T,
+        "omega_fresh_mean": omega_fresh_mean,
+        "n_fresh_readings": omega_summary.n,
         "BTC": prices["btc"],
         "ETH": prices["eth"],
         "SOL": prices["sol"]
