@@ -104,15 +104,16 @@ def generate_master_report(state: dict):
     # 1. Horizon Benchmark Table
     horizon_rows = ""
     for k in [10, 20, 50]:
-        job_key = f"fi2010_k{k}_s0"
-        j = jobs.get(job_key, {})
-        if j.get("status") == "COMPLETED" and "metrics" in j:
-            m = j["metrics"]
-            horizon_rows += f"| k={k} | {m['accuracy']:.3f} | {m['macro_f1']:.3f} | {m['gate_rate']:.3f} | {m['hermiticity']:.2e} | {m['omega']:.4f} | {m['crash_p']*100:.1f}% | {m['majority']:.3f} |\n"
+        ms = [jobs[f"fi2010_k{k}_s{sd}"]["metrics"] for sd in range(5)
+              if jobs.get(f"fi2010_k{k}_s{sd}", {}).get("status") == "COMPLETED" and "metrics" in jobs[f"fi2010_k{k}_s{sd}"]]
+        if ms:
+            ms_ = lambda key, f="{:.3f}": f"{f.format(np.mean([m[key] for m in ms]))} ± {f.format(np.std([m[key] for m in ms], ddof=1) if len(ms) > 1 else 0.0)}"
+            horizon_rows += (f"| k={k} (n={len(ms)}) | {ms_('accuracy')} | {ms_('macro_f1')} | {ms_('gate_rate')} | "
+                             f"{ms_('omega', '{:.4f}')} | {np.mean([m['majority'] for m in ms]):.3f} | "
+                             f"{np.mean([m.get('majority_macro_f1', float('nan')) for m in ms]):.3f} |\n")
         else:
-            horizon_rows += f"| k={k} | Pending / In Progress | — | — | — | — | — | — |\n"
+            horizon_rows += f"| k={k} | Pending | — | — | — | — | — |\n"
 
-    # 2. Multi-Seed Statistics (k=10)
     seed_f1s = []
     seed_accs = []
     seed_gates = []
@@ -169,13 +170,13 @@ def generate_master_report(state: dict):
 
 ## 1. Multi-Horizon Benchmarking on FI-2010 (Section 25)
 
-Benchmark results across standard DeepLOB prediction horizons ($k=10, 20, 50$ ticks).
+Benchmark results across standard FI-2010 prediction horizons (Setup 2) ($k=10, 20, 50$ ticks).
 
-| Horizon | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\\omega(A_t)$ (EWS Margin) | Crash Prob | Majority Baseline |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Horizon (mean ± std over seeds) | Accuracy | Macro-F1 | Gate Rate | $\\omega(A_t)$ (latent-flow diagnostic) | Majority acc | Majority macro-F1 |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 {horizon_rows}
 
-*Reference Baseline (Zhang et al. DeepLOB): k=10 F1 ~0.57, k=20 F1 ~0.59, k=50 F1 ~0.61.*
+*Baselines (LSTM, re-implemented DeepLOB) are trained on the same Setup 2 split and epoch budget inside each run; see the per-run RESULTS_k*_s*.md. Literature numbers are not comparable (different split) and are not quoted.*
 
 ---
 
@@ -183,7 +184,7 @@ Benchmark results across standard DeepLOB prediction horizons ($k=10, 20, 50$ ti
 
 Statistical significance across 5 random seeds (Seeds 0, 1, 2, 3, 4):
 
-| Run | Accuracy | Macro-F1 | Gate Rate | $\\omega(A_t)$ | Crash Prob |
+| Run | Accuracy | Macro-F1 | Gate Rate | $\\omega(A_t)$ | ω>0 rate (unvalidated) |
 |:---|:---:|:---:|:---:|:---:|:---:|
 {seed_rows}{stats_row}
 
@@ -292,38 +293,13 @@ def main():
     from exp_B_hybrid_fi2010.train import main as train_fi2010
 
     if not args.only_binance:
-        # ── 1. FI-2010 Horizon Benchmark: k=10 (Calibrated Baseline) ────────
-        run_job(
-            "fi2010_k10_s0",
-            "FI-2010 Horizon k=10 (Seed 0, Calibrated EWS & Sparse Gate)",
-            train_fi2010,
-            horizon=10, seed=0, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c
-        )
-
-        if not args.test:
-            # ── 2. FI-2010 Horizon Benchmark: k=20 ─────────────────────────────
-            run_job(
-                "fi2010_k20_s0",
-                "FI-2010 Horizon k=20 (Seed 0)",
-                train_fi2010,
-                horizon=20, seed=0, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c
-            )
-
-            # ── 3. FI-2010 Horizon Benchmark: k=50 ─────────────────────────────
-            run_job(
-                "fi2010_k50_s0",
-                "FI-2010 Horizon k=50 (Seed 0)",
-                train_fi2010,
-                horizon=50, seed=0, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c
-            )
-
-        # ── 4. FI-2010 Seed 1 (to establish N=2 statistical error bars) ─────
-        run_job(
-            "fi2010_k10_s1",
-            "FI-2010 Multi-Seed Statistical Run (k=10, Seed 1)",
-            train_fi2010,
-            horizon=10, seed=1, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c
-        )
+        # Task 15: every horizon gets 5 seeds (smoke test: one job only). Setup 2 data, same budget for all models.
+        horizons = (10,) if args.test else (10, 20, 50)
+        seeds    = (0,)  if args.test else range(5)
+        for k in horizons:
+            for sd in seeds:
+                run_job(f"fi2010_k{k}_s{sd}", f"FI-2010 Setup 2, k={k}, seed {sd}",
+                        train_fi2010, horizon=k, seed=sd, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c)
 
     if not args.skip_binance:
         # ── 5. Binance 3-Asset Basket (BTC, ETH, SOL with Magnetic Laplacian)
@@ -335,16 +311,6 @@ def main():
             epochs_a=binance_ep, epochs_b=binance_ep, epochs_c=binance_ep,
             max_ticks=binance_ticks
         )
-
-    if not args.only_binance and not args.test:
-        # ── 6-8. Additional Multi-Seed Validation (Seeds 2, 3, 4) ───────────
-        for s in range(2, 5):
-            run_job(
-                f"fi2010_k10_s{s}",
-                f"FI-2010 Multi-Seed Statistical Run (k=10, Seed {s})",
-                train_fi2010,
-                horizon=10, seed=s, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c
-            )
 
     # ── 9. Final Master Report Generation ──────────────────────────────────
     state = load_state()

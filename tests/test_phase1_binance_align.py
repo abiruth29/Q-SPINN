@@ -2,12 +2,12 @@
 import numpy as np, pandas as pd
 from binance_align import align_on_grid, frame_to_features, forward_labels
 
-COLS = ["mid_sum", "mid_count", "ofi", "buy_vol", "sell_vol", "trade_count", "total_pq", "total_qty"]
+COLS = ["mid_sum", "mid_count", "signed_volume", "buy_vol", "sell_vol", "trade_count", "total_pq", "total_qty"]
 
 
 def _frame(seconds, price):
     n = len(seconds)
-    d = dict(mid_sum=price * np.ones(n), mid_count=np.ones(n), ofi=np.ones(n), buy_vol=np.ones(n),
+    d = dict(mid_sum=price * np.ones(n), mid_count=np.ones(n), signed_volume=np.ones(n), buy_vol=np.ones(n),
              sell_vol=np.zeros(n), trade_count=np.ones(n), total_pq=price * np.ones(n), total_qty=np.ones(n))
     return pd.DataFrame(d, index=pd.Index(seconds, name="second"))[COLS]
 

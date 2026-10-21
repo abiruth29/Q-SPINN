@@ -7,8 +7,8 @@ from collections import deque
 
 st.set_page_config(page_title="Q-SPINN Early Warning System", layout="wide", page_icon="⚛️")
 
-st.title("⚛️ Q-SPINN Early Warning System (EWS)")
-st.markdown("Real-time phase-space divergence monitoring across the multi-asset crypto basket using the continuous-time Magnetic Graph Laplacian.")
+st.title("⚛️ Q-SPINN Latent-Flow Monitor (research prototype)")
+st.markdown("Live display of the latent-flow diagnostic ω = λ_max(S). **Not a validated crash predictor**: the alert score below is an uncalibrated sigmoid of ω, and until the forward early-warning study (docs/RUNBOOK_TEAMMATE.md, item 10) shows ω beats a rolling-volatility baseline, treat it as a diagnostic only.")
 
 # --- Sidebar Controls ---
 with st.sidebar:
@@ -18,7 +18,7 @@ with st.sidebar:
         st.session_state.last_omega = -0.3
     
     st.markdown("---")
-    dynamic_threshold = st.slider("Critical Alert Threshold (ω)", min_value=-1.0, max_value=2.0, value=0.60, step=0.05)
+    dynamic_threshold = st.slider("Display threshold (ω, uncalibrated)", min_value=-1.0, max_value=2.0, value=0.60, step=0.05)
 
 from pathlib import Path
 import json
@@ -62,10 +62,12 @@ def get_latest_inference():
 # --- Single Iteration Render ---
 data = get_latest_inference()
 
-# Calculate Crash Probability dynamically based on the threshold
+# Uncalibrated alert score (sigmoid of omega) - NOT a probability of a crash
 crash_prob = 1 / (1 + np.exp(-20 * (data['omega'] - dynamic_threshold)))
 data['crash_prob'] = crash_prob
 
+if data.get('mode'):
+    st.warning(f"Mode: {data['mode']}")
 st.session_state.history.append(data)
 df = pd.DataFrame(st.session_state.history)
 
@@ -115,7 +117,7 @@ with chart_col2:
         x=df['time'], 
         y=df['crash_prob'], 
         mode='lines', 
-        name='Crash Probability', 
+        name='Alert score (uncalibrated)', 
         line=dict(color='red', width=3),
         fill='tozeroy',
         fillcolor='rgba(255, 0, 0, 0.1)',
@@ -143,7 +145,7 @@ with chart_col2:
     fig_line.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text=f"Critical Threshold (ω={dynamic_threshold:.2f})")
     fig_line.update_layout(
         title="Real-Time EWS Metrics", 
-        yaxis=dict(title="Probability", range=[0, 1]),
+        yaxis=dict(title="Alert score (not a probability)", range=[0, 1]),
         yaxis2=dict(title="Diagnostic Scale", overlaying="y", side="right"),
         height=350,
         margin=dict(l=20, r=20, t=50, b=20),

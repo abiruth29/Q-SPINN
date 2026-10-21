@@ -10,7 +10,7 @@ WHAT THIS DOES
 1. Samples ~500K 1-second aggregation windows from the 36 Binance
    trade Parquet files (3 assets × 12 months).
 2. Engineers 6 features per asset per window:
-     log_return, ofi, realized_vol, buy_pressure, trade_count, vwap_spread
+     log_return, signed_volume, realized_vol, buy_pressure, trade_count, vwap_spread
 3. Constructs a regime mask proxy: windows where realized_vol > μ + 2σ
    (rolling 200-tick window). See Q-SPINN_Demo_Architecture.md §8.6.
 4. Trains the SNN gate (LIF stack) with surrogate gradients.
@@ -50,7 +50,7 @@ from checkpoint import save_checkpoint, load_checkpoint, guard_nan
 
 # ── hyper-parameters ─────────────────────────────────────────────────────────
 N_ASSETS       = 3
-FEATS_PER_ASSET = 6          # log_return, ofi, realized_vol, buy_pressure, trade_count, vwap_spread
+FEATS_PER_ASSET = 6          # log_return, signed_volume, realized_vol, buy_pressure, trade_count, vwap_spread
 N_FEATURES     = N_ASSETS * FEATS_PER_ASSET   # 18
 SEQ_LEN        = 20          # lookback window (ticks = 1-second bins)
 HORIZON        = 5           # prediction horizon
@@ -135,7 +135,7 @@ class ToySNN(nn.Module):
 # ── data engineering ──────────────────────────────────────────────────────────
 _BATCH   = 2_000_000   # raw rows per streaming batch (~120-200 MB RAM)
 _AGG_OPS = {
-    "mid_sum": "sum", "mid_count": "sum", "ofi": "sum",
+    "mid_sum": "sum", "mid_count": "sum", "signed_volume": "sum",
     "buy_vol": "sum", "sell_vol":  "sum", "trade_count": "sum",
     "total_pq": "sum", "total_qty": "sum",
 }
@@ -157,7 +157,7 @@ def _batch_to_seconds(batch):
     return pd.DataFrame({
         "mid_sum"    : g["price"].sum(),
         "mid_count"  : g["price"].count(),
-        "ofi"        : g["signed_qty"].sum(),
+        "signed_volume"        : g["signed_qty"].sum(),
         "buy_vol"    : g["qty_buy"].sum(),
         "sell_vol"   : g["qty_sell"].sum(),
         "trade_count": g["qty"].count(),
@@ -224,7 +224,7 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int) -> np.ndarray
     combined["vwap_spread"]  = (combined["vwap"] - combined["mid_price"]).abs() / combined["mid_price"].clip(lower=1e-8)
 
     feats = combined[
-        ["log_return", "ofi", "realized_vol", "buy_pressure", "trade_count", "vwap_spread"]
+        ["log_return", "signed_volume", "realized_vol", "buy_pressure", "trade_count", "vwap_spread"]
     ].values.astype(np.float32)
     return feats[:max_ticks]
 

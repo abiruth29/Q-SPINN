@@ -773,7 +773,7 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
     return model
 
 
-def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
+def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024, return_pred=False):
     model.eval()
     preds, rates, pdes, omegas = [], [], [], []
     meter = RateMeter()
@@ -799,6 +799,8 @@ def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
             if herm > H_herm_max: H_herm_max = herm
             
     pred = torch.cat(preds)
+    if return_pred:
+        return pred
     omega_all = torch.cat(omegas)
     
     return dict(
@@ -877,19 +879,19 @@ def write_results(ablation_rows, m_full, timestamp, device_name, majority, out_p
 
 | Property | Value |
 |---|---|
-| Source | FI-2010 NoAuction Z-Score (`data/reference/fi2010/fi2010_noauction_zscore.parquet`) |
+| Source | FI-2010 NoAuction Z-Score, **Setup 2** (`data/reference/fi2010/fi2010_setup2.parquet`; train days 1-7, test days 8-10; windows never cross stock/day segments) |
 | Features | 144 (10 LOB levels × 4 quantities × 1 stock, + 4 derived) |
 | Label | `label_k{horizon}` (3-class mid-price direction, {horizon}-tick horizon) |
 | Seed | {seed} |
-| Train | Folds 1–7 |
-| Val | Fold 8 |
-| Test | Fold 9 |
+| Train | Setup 2 days 1-6 |
+| Val | Setup 2 day 7 |
+| Test | Setup 2 days 8, 9, 10 |
 | Normalization | Pre-normalized by FI-2010 authors (Z-score, no leakage) |
 | Regime proxy | realized_vol > μ + {REGIME_SIGMA}σ (rolling {REGIME_WINDOW}-tick window) |
 
 ## Ablation Results
 
-| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\omega(A_t)$ (EWS Margin) | Crash Prob ($\omega>0$) |
+| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\omega(A_t)$ (latent-flow diagnostic) | $\omega>0$ rate (unvalidated, not a crash probability) |
 |---|---|---|---|---|---|---|
 {rows_md}| **Majority baseline** | **{majority:.3f}** | — | — | — | — | — |
 
@@ -1034,6 +1036,14 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     ablation_rows.append(("LSTM baseline", (p == yte.cpu()).float().mean().item(),
                            macro_f1(p, yte.cpu()), float('nan'), float('nan'), float('nan'), float('nan')))
 
+    # Task 15: DeepLOB re-implementation on the same windows/split/epoch budget as the LSTM baseline
+    from baselines import DeepLOB, train_classifier, predict, count_params
+    dl = train_classifier(DeepLOB(), Xtr, ytr, Xva, yva, device, macro_f1, epochs=lstm_epochs, seed=seed)
+    p_dl = predict(dl, Xte, device)
+    log.metric("DeepLOB params", count_params(dl))
+    ablation_rows.append(("DeepLOB (re-implemented, same split)", (p_dl == yte.cpu()).float().mean().item(),
+                           macro_f1(p_dl, yte.cpu()), float('nan'), float('nan'), float('nan'), float('nan')))
+
     m_cheap = evaluate(model, Xte, yte, rte, dt_te, mode="cheap")
     ablation_rows.append(("SNN only", m_cheap["acc"], m_cheap["f1"], 0.0, m_cheap["herm"], m_cheap["omega"], m_cheap["crash_P"]))
 
@@ -1043,8 +1053,14 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     m = evaluate(model, Xte, yte, rte, dt_te, mode="learned")
     ablation_rows.append(("Q-SPINN (full hybrid)", m["acc"], m["f1"], m["gate"], m["herm"], m["omega"], m["crash_P"]))
 
+    from stats import block_bootstrap_f1
+    ci = {}
+    for tag, mode in (("hybrid", "learned"), ("cheap", "cheap"), ("dense", "dense")):
+        pr = evaluate(model, Xte, yte, rte, dt_te, mode=mode, return_pred=True)
+        ci[tag] = block_bootstrap_f1(pr.numpy(), yte.numpy(), n_boot=500)
+        log.metric(f"macro-F1 95% CI ({tag})", f"{ci[tag][0]:.3f} [{ci[tag][1]:.3f}, {ci[tag][2]:.3f}]")
     log.table(
-        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "Crash P"],
+        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "w>0 rate"],
         rows=[
             (name, f"{acc:.3f}", f"{f1:.3f}",
              "n/a" if gate != gate else f"{gate:.3f}",
@@ -1065,6 +1081,12 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     # Also save to default path for standard single-asset compatibility
     if horizon == 10 and seed == 0:
         torch.save(model.state_dict(), OUT_DIR / "qspinn_fi2010.pt")
+    from live_contract import make_contract, save_contract   # Task 17: record the input contract
+    save_contract(out_dir / f"qspinn_fi2010_k{horizon}_s{seed}_contract.json",
+                  make_contract(SEQ_LEN, N_FEATURES, "fi2010_authors", "dataset_zscore", "equity"))
+    if horizon == 10 and seed == 0:
+        save_contract(OUT_DIR / "qspinn_fi2010_contract.json",
+                      make_contract(SEQ_LEN, N_FEATURES, "fi2010_authors", "dataset_zscore", "equity"))
 
     timestamp = datetime.now().isoformat()
     gpu_name  = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -1093,6 +1115,10 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         "omega"              : full_m[5] if full_m[5] == full_m[5] else 0.0,
         "crash_p"            : full_m[6] if full_m[6] == full_m[6] else 0.0,
         "majority"           : majority,
+        "majority_macro_f1"  : majority_f1,
+        "f1_ci95"            : list(ci["hybrid"][1:]),
+        "f1_ci95_cheap"      : list(ci["cheap"][1:]),
+        "f1_ci95_dense"      : list(ci["dense"][1:]),
         "weights_path"       : str(weights_path),
         "results_path"       : str(res_path)
     }

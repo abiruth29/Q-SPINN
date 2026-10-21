@@ -57,7 +57,7 @@ if torch.cuda.is_available():
 
 # ── hyper-parameters ─────────────────────────────────────────────────────────
 N_ASSETS        = 3
-FEATS_PER_ASSET = 6           # log_return, ofi, realized_vol, buy_pressure, trade_count, vwap_spread
+FEATS_PER_ASSET = 6           # log_return, signed_volume, realized_vol, buy_pressure, trade_count, vwap_spread
 N_FEATURES      = N_ASSETS * FEATS_PER_ASSET   # 18
 PSI_DIM         = 8           # Dimension per asset -> Total Psi Dim = 24
 HIDDEN          = 64
@@ -389,7 +389,7 @@ class MultiAssetQSPINN(nn.Module):
 # ── data engineering ──────────────────────────────────────────────────────────
 _BATCH = 2_000_000
 _AGG_OPS = {
-    "mid_sum": "sum", "mid_count": "sum", "ofi": "sum",
+    "mid_sum": "sum", "mid_count": "sum", "signed_volume": "sum",
     "buy_vol": "sum", "sell_vol":  "sum", "trade_count": "sum",
     "total_pq": "sum", "total_qty": "sum",
 }
@@ -415,7 +415,7 @@ def _batch_to_seconds(batch, time_col="time"):
     return pd.DataFrame({
         "mid_sum"    : g["price"].sum(),
         "mid_count"  : g["price"].count(),
-        "ofi"        : g["signed_qty"].sum(),
+        "signed_volume"        : g["signed_qty"].sum(),
         "buy_vol"    : g["qty_buy"].sum(),
         "sell_vol"   : g["qty_sell"].sum(),
         "trade_count": g["qty"].count(),
@@ -870,7 +870,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     ablation_rows.append(("Q-SPINN Multi-Asset Hybrid", m["acc"], m["f1"], m["gate"], m["herm"], m["omega"], m["crash_P"]))
 
     log.table(
-        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "Crash P"],
+        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "w>0 rate"],
         rows=[
             (name, f"{acc:.3f}", f"{f1:.3f}",
              "n/a" if gate != gate else f"{gate:.3f}",
@@ -887,6 +887,8 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     phi = m["Phi_anti"]
     btc_eth_lead = phi[0, 1]
     btc_sol_lead = phi[0, 2]
+    loop_flux = float(phi[0, 1] + phi[1, 2] + phi[2, 0])    # gauge-invariant cycle flux
+    log.info(f"Loop flux BTC->ETH->SOL->BTC (gauge-invariant): {loop_flux:+.4f} rad")
     log.info(f"Learned Phase Flux BTC -> ETH: {btc_eth_lead:+.4f} rad")
     log.info(f"Learned Phase Flux BTC -> SOL: {btc_sol_lead:+.4f} rad")
 
@@ -899,20 +901,25 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
 **Date:** {datetime.now().isoformat()}  
 **Assets:** BTCUSDT, ETHUSDT, SOLUSDT (18 features total)  
 **Prediction Horizon:** 5 seconds  
+**Clock:** common 1 s grid (v3.1 protocol)  
 
 ## Ablation Results
 
-| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\\omega(A_t)$ (EWS Margin) | Crash Prob |
+| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\\omega(A_t)$ (latent-flow diagnostic) | ω>0 rate (unvalidated) |
 |---|---|---|---|---|---|---|
 {rows_md}| **Majority baseline** | **{majority:.3f}** | — | — | — | — | — |
 
-## Magnetic Graph Laplacian & Lead-Lag Phase Analysis
+## Magnetic Graph Laplacian - antisymmetric phase matrix (diagnostic only)
 
-The directed phase flux matrix $\\Phi_{{ij}}$ captures empirical lead-lag latency:
-- **BTC $\\to$ ETH Phase Flux:** `{btc_eth_lead:+.4f}` rad
-- **BTC $\\to$ SOL Phase Flux:** `{btc_sol_lead:+.4f}` rad
+The learned antisymmetric phase matrix $\\Phi_{{ij}}$ is **gauge-dependent**: individual edge phases can be
+shifted by a node gauge transform without changing the physics. Only gauge-invariant loop quantities
+are meaningful, and even those are *not* evidence of causal lead-lag between assets.
+- BTC-ETH edge phase (gauge-dependent, do not interpret): `{btc_eth_lead:+.4f}` rad
+- BTC-SOL edge phase (gauge-dependent, do not interpret): `{btc_sol_lead:+.4f}` rad
+- BTC-ETH-SOL loop flux (gauge-invariant): `{loop_flux:+.4f}` rad
 
-A positive phase indicates that BTC microstructure features lead altcoin quote adjustments, confirming Objective O2.
+No lead-lag claim is made from these numbers. A lead-lag statement requires an out-of-sample predictive
+increment over directional temporal baselines (see docs/RUNBOOK_TEAMMATE.md, item 20).
 """
     (OUT_DIR / "RESULTS.md").write_text(md, encoding="utf-8")
     if CKPT_PATH.exists(): CKPT_PATH.unlink()
@@ -923,6 +930,7 @@ A positive phase indicates that BTC microstructure features lead altcoin quote a
         "gate": m["gate"],
         "btc_eth_lead": float(btc_eth_lead),
         "btc_sol_lead": float(btc_sol_lead),
+        "loop_flux": loop_flux,
         "weights": str(OUT_DIR / "qspinn_binance_multi_asset.pt")
     }
     log.done(summary=summary)

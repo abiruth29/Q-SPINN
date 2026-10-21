@@ -14,6 +14,8 @@ from ingestor import stream_live
 from exp_B_hybrid_fi2010.train import QSPINN, N_ASSETS
 
 from lob_extractor import FI2010Extractor
+from live_contract import make_contract, load_contract, contracts_match, LiveWindow
+from exp_B_hybrid_fi2010.train import SEQ_LEN, N_FEATURES
 
 # Initialize the Trained Q-SPINN (Exp B - FI-2010)
 # Forced to CPU for live inference to prevent background CUDA context crashes
@@ -26,6 +28,15 @@ if ckpt_path.exists():
 else:
     print("⚠️ Weights not found, using random initialization")
 model.eval()
+
+# Task 17: input contract.  The live extractor produces online-z-scored crypto features, the FI-2010
+# weights were trained on dataset-normalised equity features -> NOT a match.  Product inference needs
+# a model retrained on matched live inputs (a *_contract.json next to the weights); otherwise --demo.
+LIVE_CONTRACT = make_contract(SEQ_LEN, N_FEATURES, "binance_depth_extractor", "online_zscore", "crypto")
+TRAIN_CONTRACT = load_contract(ckpt_path.with_name("qspinn_fi2010_contract.json"))
+CONTRACT_OK, CONTRACT_MISMATCH = contracts_match(TRAIN_CONTRACT, LIVE_CONTRACT)
+MODE = "PRODUCTION" if CONTRACT_OK else "DEMONSTRATION (weights not trained on this input contract)"
+window = LiveWindow(SEQ_LEN, N_FEATURES)
 
 LOG_FILE = ROOT / "live_inference.jsonl"
 last_write = time.time()
@@ -66,34 +77,24 @@ async def process_tick(stream_name, payload):
         return
     last_write = time.time()
     
-    # Use the 144 features for BTC to feed into our FI-2010 trained weights
-    stacked_features = latest_features["btc"]
-    
-    # Keep a rolling window of 2 ticks so the HamiltonianNet can compute velocities (seq_len > 0)
-    if not hasattr(process_tick, "feature_history"):
-        process_tick.feature_history = deque([stacked_features, stacked_features], maxlen=2)
-    else:
-        process_tick.feature_history.append(stacked_features)
-        
-    features_seq = np.stack(process_tick.feature_history)
-    features = torch.tensor(features_seq, dtype=torch.float32, device=device).unsqueeze(0)
-    
-    # LIVE INFERENCE: Pass through Heavy Path to get the Hamiltonian
+    # Task 17: fixed-length window identical to training (no duplicate padding); wait until it is full
+    window.push(latest_features["btc"])
+    if not window.ready:
+        return
+    features = window.tensor().to(device)
+
+    # LIVE INFERENCE: heavy path -> generator S; omega = lambda_max(S) is a LATENT-FLOW DIAGNOSTIC,
+    # not a validated crash probability (see docs/RUNBOOK_TEAMMATE.md, item 10).
     with torch.no_grad():
         heavy, L_pde, H, S, L_cov, L_norm = model.heavy_path(features)
-        
-        # Calculate Numerical Abscissa (omega) from the Symmetric generator component S
         omega = torch.linalg.eigvalsh(S)[:, -1].item()
         omega_history.append(omega)
-        
-        # V3-06: Time-Integrated Numerical Abscissa (Riemann sum integral)
         Omega_T = sum(omega_history) * 0.5
-        
-        # V3-07: Phase-Space Divergence Diagnostic
         d_J = torch.trace(S[0]).item()
-        
+
     data = {
         "time": datetime.now().strftime("%H:%M:%S"),
+        "mode": MODE,
         "omega": omega,
         "Omega_T": Omega_T,
         "d_J": d_J,
@@ -111,8 +112,14 @@ import argparse
 async def main():
     parser = argparse.ArgumentParser(description="Q-SPINN Live Pipeline")
     parser.add_argument("--backfill", action="store_true", help="Run historical data backfill before streaming")
+    parser.add_argument("--demo", action="store_true",
+                        help="allow running with weights whose training contract does not match the live inputs")
     args = parser.parse_args()
-    
+    if not CONTRACT_OK and not args.demo:
+        raise SystemExit("Refusing to run: training/live input contract mismatch on "
+                         f"{CONTRACT_MISMATCH}. Retrain on matched live inputs, or pass --demo to run a "
+                         "clearly labelled demonstration.")
+    print(f"Mode: {MODE}")
     print("=== Launching Q-SPINN Production Pipeline ===")
     
     if args.backfill:

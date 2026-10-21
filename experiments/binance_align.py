@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-FLOW_COLS = ["ofi", "buy_vol", "sell_vol", "trade_count", "total_pq", "total_qty"]
+FLOW_COLS = ["signed_volume", "buy_vol", "sell_vol", "trade_count", "total_pq", "total_qty"]
 PRICE_COLS = ["mid_sum", "mid_count"]
 
 
@@ -48,7 +48,7 @@ def frame_to_features(g: pd.DataFrame) -> np.ndarray:
     bp = (g["buy_vol"] / (g["buy_vol"] + g["sell_vol"]).clip(lower=1e-8)).where(
         (g["buy_vol"] + g["sell_vol"]) > 0, 0.5)
     spread = (vwap - mid).abs() / mid.clip(lower=1e-8)
-    return np.column_stack([logret, g["ofi"], rv, bp, g["trade_count"], spread]).astype(np.float32)
+    return np.column_stack([logret, g["signed_volume"], rv, bp, g["trade_count"], spread]).astype(np.float32)
 
 
 def forward_labels(returns: np.ndarray, horizon: int, train_end: int, q=(33.33, 66.67)):
