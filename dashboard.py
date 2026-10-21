@@ -23,7 +23,9 @@ with st.sidebar:
 from pathlib import Path
 import json
 
-# --- Mock Data Generator (Replace with actual inference feed later) ---
+# --- Live feed (simulated data only when explicitly enabled) ---
+import os
+ALLOW_MOCK = os.environ.get('QSPINN_DASH_MOCK') == '1'
 if 'history' not in st.session_state:
     st.session_state.history = deque(maxlen=60)
     
@@ -39,7 +41,9 @@ def get_latest_inference():
         except Exception:
             pass
             
-    # Fallback mock generator if pipeline isn't running yet
+    if not ALLOW_MOCK:
+        return None
+    # Simulated feed - ONLY when QSPINN_DASH_MOCK=1; the page shows a SIMULATED banner
     if 'last_omega' not in st.session_state:
         st.session_state.last_omega = -0.3
         
@@ -61,6 +65,11 @@ def get_latest_inference():
 
 # --- Single Iteration Render ---
 data = get_latest_inference()
+if data is None:
+    st.error('No live inference feed (live_inference.jsonl not found). Start pipeline.py, or set QSPINN_DASH_MOCK=1 for a clearly labelled simulation.')
+    st.stop()
+if ALLOW_MOCK and not data.get('mode'):
+    data['mode'] = 'SIMULATED DATA - not model output'
 
 # Uncalibrated alert score (sigmoid of omega) - NOT a probability of a crash
 crash_prob = 1 / (1 + np.exp(-20 * (data['omega'] - dynamic_threshold)))
@@ -77,7 +86,7 @@ c1.metric(label="BTC/USDT", value=f"${data['BTC']:,.2f}")
 c2.metric(label="ETH/USDT", value=f"${data['ETH']:,.2f}")
 c3.metric(label="SOL/USDT", value=f"${data['SOL']:,.2f}")
 
-status_color = "🔴 DANGER (Phase-Space Divergence)" if data['omega'] > dynamic_threshold else "🟢 STABLE (Mean-Reverting)"
+status_color = "🟠 ω above display threshold (diagnostic only)" if data['omega'] > dynamic_threshold else "⚪ ω below display threshold (diagnostic only)"
 c4.metric(label="System Status", value=status_color)
 
 st.markdown("---")

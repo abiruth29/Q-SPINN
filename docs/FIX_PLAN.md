@@ -24,7 +24,7 @@ section of the project report (Chapter 7) that describes the problem.
       residual with an innovation (Kalman) negative log-likelihood.
 - [ ] Return a gradient for the surrogate slope α, or fix it as a hyperparameter.
 - [x] Fit the delta-encoding threshold on training statistics (not per batch).
-- [ ] Rename the recursive filter as smoothing, or implement a proper state-space filter.
+- [x] Recursive filter relabelled as coefficient *smoothing* (no state-space claim); a proper state-space model remains future work.
 
 ## 4. Early-warning indicator (Report §7.4)
 - [x] Forward-looking instability label over horizon τ (no overlap with the input window).
@@ -43,8 +43,33 @@ section of the project report (Chapter 7) that describes the problem.
 
 ## 7. Repository hygiene
 - [x] Replace `validate_*.py` (hard-coded Windows paths) with runnable unit tests.
-- [x] Live pipeline: train on target-market data; use 20-step windows and the full feature set.
+- [ ] Live pipeline: train on target-market data; use 20-step windows and the full feature set.  *(Only a contract guard + 20-step window + `--demo` label exist; a model retrained on live crypto inputs does NOT.)*
 
 
 ---
-**Status:** code changes complete for phases 0-3 (checked items). Unchecked items need teammate runs (five-seed benchmarks, latency, CPU/GPU, regenerated documents) - see `RUNBOOK_TEAMMATE.md`. Phase 4 is deferred.
+**Status (superseded by the review-2 section below):** first-pass code changes for phases 0-3. Unchecked items need teammate runs (five-seed benchmarks, latency, CPU/GPU, regenerated documents) - see `RUNBOOK_TEAMMATE.md`. Phase 4 is deferred.
+
+
+## Review 2 (commit ec9b0bd) — verified defects and their status
+
+| Rank | Item | Status |
+|---|---|---|
+| 1 | Versioned run state / checkpoints; legacy weights archived | done (`PROTOCOL_VERSION`) |
+| 2 | Generated claims, dashboard mock data, diagnostic labels | done |
+| 3 | Aggregate gradient-norm guard | done |
+| 4 | Surrogate slope fixed (declared hyperparameter) | done |
+| 5 | Tie-safe routing budget | done |
+| 6 | Grouped AP, bootstrap start range / short series / segment blocks | done (segment-aware bootstrap wired in driver where segment ids exist) |
+| 7 | Encoder fit excludes joins | done |
+| 8 | Label / warning cutoffs use only fully-in-training summaries | done |
+| 9 | Causal grid seeding + long-gap policy | done |
+| 10 | Pre-load contract/protocol check for live demo | done |
+| 11 | Prefix-only residual generator through `heavy_path` | done |
+| 12 | Real conditional `infer()` (no loss-only work) | done |
+| 13 | Matched full-pipeline latency | done (driver) |
+| 14 | Authoritative FI-2010 segment metadata, fail closed | see below |
+| 15 | Scale-collapse loophole | done (relative residual + window anchor) |
+| 16 | Event-based warning lead time / false alarms per unit time | see below |
+| 17 | Exp A migration; equal baseline budgets | see below |
+| 18 | Smoothing relabel | done |
+| 19 | Covariance disabled until observation model exists | unchanged (off) |

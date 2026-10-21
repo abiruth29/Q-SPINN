@@ -21,8 +21,8 @@ SWAP STATUS
 SWAP-01: ✅ Real FI-2010 LOB data (NoAuction Z-score)
 SWAP-02: ✅ Pre-normalized by FI-2010 authors (no leakage)
 SWAP-03: ✅ Train-only per-feature delta thresholds (v3.1: SpikeEncoder, no batch dependence)
-SWAP-04: ✅ Learnable slope parameter (alpha) for arctan surrogate gradient
-SWAP-05: ✅ Highly optimized custom LIF layer with dynamic beta/alpha
+SWAP-04: ✅ Arctan surrogate gradient with a FIXED slope (a hyperparameter; the slope is not trained)
+SWAP-05: ✅ Custom LIF layer (learned membrane time constant, fixed surrogate slope)
 SWAP-08: ✅ Kendall et al. homoscedastic adaptive loss weighting
 SWAP-15: ✅ Statistically validated 2σ realized-volatility regime proxy mask
 """
@@ -107,7 +107,7 @@ class IrregularLIFLayer(nn.Module):
         super().__init__()
         self.fc = nn.Linear(n_in, n_out)
         self.tau_m = nn.Parameter(torch.tensor(tau_m))
-        self.alpha = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha", torch.tensor(2.0))   # FIXED surrogate slope (hyperparameter, not trained)
 
     def forward(self, x_seq, dt_seq):
         import torch.nn.functional as F
@@ -178,7 +178,8 @@ class HamiltonianNet(nn.Module):
         out_dim = (n_assets * 3 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
         self.net = nn.Sequential(nn.Linear(n_in, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, out_dim))
         
-        # Ornstein-Uhlenbeck / Kalman Filter stochastic parameters
+        # Exponential-smoothing recursion on the generator coefficients (Kalman-*style* gain, NOT a state-space
+        # filter: the coefficients are network outputs, not a hidden state with a validated observation model).
         self.theta = nn.Parameter(torch.full((n_assets,), 0.1))
         self.log_Q = nn.Parameter(torch.full((n_assets,), -3.0))
         self.log_R = nn.Parameter(torch.full((n_assets,), -2.0))
@@ -324,7 +325,7 @@ class SNNGate(nn.Module):
         self.lif2       = IrregularLIFLayer(HIDDEN, HIDDEN)
         self.cheap_head = LeakyReadout(HIDDEN, 3)
         self.gate_head  = LeakyReadout(HIDDEN, 1)
-        self.alpha_gate = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha_gate", torch.tensor(2.0))   # FIXED surrogate slope
         nn.init.constant_(self.gate_head.fc.bias, 0.5)
 
     def forward(self, spikes, dt_seq):
@@ -365,7 +366,7 @@ class QSPINN(nn.Module):
         self.log_var_regime = nn.Parameter(torch.tensor(0.0))
 
     def heavy_path(self, x):
-        # Pass the entire sequence of velocities to the Kalman Filter
+        # Pass the whole velocity sequence through the coefficient-smoothing recursion (see HamiltonianNet note)
         velocities = x[:, 1:] - x[:, :-1]
         (H_tot, S_tot), (H_res, S_res) = self.ham(velocities, with_prefix=True)   # prefix ends at T-2: causal residual
         
@@ -948,11 +949,14 @@ Three-stage training was used:
 2. **Stage B ({ep_b} epochs):** Heavy path only + EWS regularization (SNN frozen)
 3. **Stage C ({ep_c} epochs):** Gate head only with sparsity calibration (everything else frozen)
 
-## Key Findings
+## Notes on interpretation
 
-- The Hermiticity check `‖H − H†‖` is exactly 0.00e+00 by construction.
-- Gate selectivity triggers on true regime shifts while keeping heavy compute sparse (~5-10%).
-- Early Warning System: $\omega(A_t) \le 0$ during stable markets, transitioning to $\omega > 0$ during volatility bursts.
+- `‖H − H†‖` is zero because H is *constructed* Hermitian; it checks the code path, it is not an empirical result.
+- The gate rate is the **global** share of test windows routed to the heavy expert. It is a budget statistic, not a
+  compute saving: measured latency is reported separately by `routing_study.py`.
+- $\omega(A_t)=\lambda_{\max}(S)$ is a latent-flow diagnostic. Whether it forecasts instability is decided only by
+  `early_warning_study.py` against a rolling-volatility baseline.
+- Nothing in this file is a claim about trading performance.
 """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(md, encoding="utf-8")

@@ -14,7 +14,7 @@ WHAT THIS DOES
    - Van Loan Continuous-to-Discrete Covariance Propagation
    - Early Warning System (Numerical Abscissa contractive regularization)
    - Event-driven SNN Gating
-4. Evaluates lead-lag relationships (BTC phase lead over ETH and SOL).
+4. Reports the gauge-invariant loop flux of the learned phase matrix (no lead-lag claim).
 5. Compares against SNN-only, PINN-only, and LSTM baselines.
 6. Saves model weights and generates RESULTS.md.
 """
@@ -102,7 +102,7 @@ class IrregularLIFLayer(nn.Module):
         super().__init__()
         self.fc = nn.Linear(n_in, n_out)
         self.tau_m = nn.Parameter(torch.tensor(tau_m))
-        self.alpha = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha", torch.tensor(2.0))   # FIXED surrogate slope
 
     def forward(self, x_seq, dt_seq):
         B, T, _ = x_seq.shape
@@ -295,7 +295,7 @@ class SNNGate(nn.Module):
         self.lif2       = IrregularLIFLayer(HIDDEN, HIDDEN)
         self.cheap_head = LeakyReadout(HIDDEN, 3)
         self.gate_head  = LeakyReadout(HIDDEN, 1)
-        self.alpha_gate = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha_gate", torch.tensor(2.0))   # FIXED surrogate slope
         nn.init.constant_(self.gate_head.fc.bias, 0.5)
 
     def forward(self, spikes, dt_seq):
@@ -928,7 +928,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     )
 
     # Lead-lag analysis
-    log.section("Magnetic Graph Lead-Lag Latency Analysis")
+    log.section("Magnetic Graph phase matrix (diagnostic; gauge-dependent)")
     phi = m["Phi_anti"]
     btc_eth_lead = phi[0, 1]
     btc_sol_lead = phi[0, 2]
