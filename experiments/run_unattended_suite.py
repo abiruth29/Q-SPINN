@@ -99,7 +99,10 @@ def save_state(state: dict):
 
 
 def generate_master_report(state: dict):
-    jobs = state.get("jobs", {})
+    from qspinn_core import PROTOCOL_VERSION
+    # only results produced under the CURRENT protocol may appear in a corrected report
+    jobs = {k: v for k, v in state.get("jobs", {}).items()
+            if v.get("status") != "COMPLETED" or v.get("protocol") == PROTOCOL_VERSION}
     
     # 1. Horizon Benchmark Table
     horizon_rows = ""
@@ -212,6 +215,13 @@ Validates cross-asset Magnetic Graph Laplacian coupling on Binance microstructur
 
 def run_job(job_id: str, desc: str, fn, *args, **kwargs):
     state = load_state()
+    from qspinn_core import PROTOCOL_VERSION
+    old = state["jobs"].get(job_id, {})
+    if old.get("status") == "COMPLETED" and old.get("protocol") != PROTOCOL_VERSION:
+        log(f"♻️  [STALE] {job_id}: completed under protocol {old.get('protocol')!r}, current is "
+            f"{PROTOCOL_VERSION!r} -> ignoring legacy result and retraining.")
+        state["jobs"].pop(job_id)
+        save_state(state)
     if job_id in state["jobs"] and state["jobs"][job_id].get("status") == "COMPLETED":
         log(f"⏩ [SKIP] {desc} (Already marked COMPLETED in suite_state.json)")
         return state["jobs"][job_id].get("metrics")
@@ -235,6 +245,7 @@ def run_job(job_id: str, desc: str, fn, *args, **kwargs):
         state = load_state()
         state["jobs"][job_id] = {
             "status": "COMPLETED",
+            "protocol": PROTOCOL_VERSION,
             "completed_at": datetime.now().isoformat(),
             "elapsed_seconds": elapsed,
             "metrics": metrics

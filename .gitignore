@@ -64,3 +64,4 @@ presentation/JPG/
 Thumbs.db
 .vscode/
 .idea/
+experiments/suite_state*.json

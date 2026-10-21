@@ -76,10 +76,21 @@ def rolling_vol_score(mid: np.ndarray, window: int = 20) -> np.ndarray:
 
 
 def select_threshold(val_scores: np.ndarray, fraction: float) -> float:
-    """Score threshold routing the top `fraction` of VALIDATION samples (no test labels involved)."""
+    """
+    Budget-safe threshold chosen on VALIDATION scores only.  Policy for ties: the routed set is
+    {score >= t}; t is the smallest value whose routed share does not exceed `fraction`
+    (so tied scores are routed together or not at all, and the budget is never exceeded; with
+    all-equal scores a fraction < 1 routes nothing).  fraction<=0 -> inf, fraction>=1 -> -inf.
+    """
     if fraction <= 0: return float("inf")
     if fraction >= 1: return float("-inf")
-    return float(np.quantile(val_scores, 1.0 - fraction))
+    v = np.sort(np.asarray(val_scores))
+    n = len(v)
+    uniq = np.unique(v)[::-1]                                   # descending distinct values
+    # share(t) = #{v >= t}/n via searchsorted on the sorted array
+    share = (n - np.searchsorted(v, uniq, side="left")) / n
+    ok = np.flatnonzero(share <= fraction + 1e-12)
+    return float(uniq[ok[-1]]) if len(ok) else float("inf")
 
 
 def routed_predictions(scores, cheap_pred, heavy_pred, thr):
@@ -187,9 +198,17 @@ def auroc(scores: np.ndarray, y: np.ndarray) -> float:
 
 
 def auprc(scores: np.ndarray, y: np.ndarray) -> float:
-    o = np.argsort(-scores, kind="mergesort"); ys = y[o]
-    tp = np.cumsum(ys); prec = tp / np.arange(1, len(ys) + 1)
-    return float((prec * ys).sum() / max(ys.sum(), 1))
+    """Average precision with equal-score groups collapsed to one threshold (order-invariant under ties)."""
+    scores, y = np.asarray(scores), np.asarray(y)
+    npos = y.sum()
+    if npos == 0: return float("nan")
+    o = np.argsort(-scores, kind="mergesort"); ss, ys = scores[o], y[o]
+    tp = np.cumsum(ys); k = np.arange(1, len(ys) + 1)
+    last = np.r_[ss[1:] != ss[:-1], True]                       # last index of each tie group
+    tp_g, k_g = tp[last], k[last]
+    prec, rec = tp_g / k_g, tp_g / npos
+    rec_prev = np.r_[0.0, rec[:-1]]
+    return float(np.sum((rec - rec_prev) * prec))
 
 
 def alert_metrics(prob: np.ndarray, y: np.ndarray, alert_thr: float, tau: int):

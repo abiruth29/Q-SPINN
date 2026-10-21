@@ -20,6 +20,7 @@ Checkpoint format (a plain dict, stored as a .pt file):
 
 from pathlib import Path
 import torch
+from qspinn_core import PROTOCOL_VERSION
 
 
 def save_checkpoint(ckpt: dict, path: Path, log=None) -> None:
@@ -29,6 +30,7 @@ def save_checkpoint(ckpt: dict, path: Path, log=None) -> None:
     Writes to a .tmp file first, then renames it, so a crash mid-write
     never produces a half-written (corrupted) checkpoint.
     """
+    ckpt = dict(ckpt, protocol=PROTOCOL_VERSION)
     tmp = path.with_suffix(".tmp")
     torch.save(ckpt, tmp)
     tmp.replace(path)          # atomic on all major OS
@@ -55,6 +57,11 @@ def load_checkpoint(path: Path, log=None) -> dict | None:
         if missing:
             raise KeyError(f"Checkpoint missing keys: {missing}")
 
+        if ckpt.get("protocol") != PROTOCOL_VERSION:
+            msg = (f"Checkpoint '{path.name}' has protocol {ckpt.get('protocol')!r} != {PROTOCOL_VERSION!r}; "
+                   "ignoring it and starting fresh (never load legacy tensors into the new architecture).")
+            (log.warn(msg) if log else print(f"\n⚠  {msg}\n"))
+            return None
         if log:
             log.info(f"Resuming from checkpoint: epoch {ckpt['epoch']}, stage {ckpt['stage']}")
         return ckpt

@@ -24,6 +24,11 @@ import torch
 import torch.nn as nn
 
 
+# Bump whenever model/data/protocol semantics change.  Run state, checkpoints, weights and live
+# contracts carry this string and are REJECTED on mismatch (review item: stale COMPLETED jobs).
+PROTOCOL_VERSION = "v3.1.1-setup2-commonclock"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 01  Pre-update numerical safety
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,7 +74,12 @@ class StepGuard:
         grads = [p.grad for p in params if p.grad is not None]
         if any(not torch.isfinite(g).all() for g in grads):
             return self._skip(opt)
-        gn = torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+        # aggregate norm can overflow to inf even when every entry is finite -> reject BEFORE the step
+        gn = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.double()) for g in grads])) if grads \
+            else torch.zeros(())
+        if not torch.isfinite(gn):
+            return self._skip(opt)
+        torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
         self.last_grad_norm = float(gn)
         opt.step()
         self.n_steps += 1

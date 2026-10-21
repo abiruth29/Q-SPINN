@@ -11,26 +11,43 @@ def _macro_f1(pred, true, n=3):
     return float(np.mean(f))
 
 
-def block_bootstrap_f1(pred, true, block=200, n_boot=1000, alpha=0.05, seed=0):
+def _block_indices(n, block, rng, seg=None):
+    """
+    One bootstrap resample of row indices made of contiguous blocks.  Every legal start (0..n-block,
+    INCLUSIVE) can be drawn; blocks longer than the series shrink to n.  With `seg` (per-row stock/day
+    id) only starts whose whole block lies inside one segment are legal (no block crosses a join);
+    a segment shorter than the block is simply never a start.
+    """
+    block = max(1, min(block, n))
+    starts = np.arange(0, n - block + 1)
+    if seg is not None:
+        seg = np.asarray(seg)
+        starts = starts[seg[starts] == seg[starts + block - 1]]
+        if len(starts) == 0:
+            raise ValueError("no block fits inside a single segment; reduce `block`")
+    nb = int(np.ceil(n / block))
+    st = rng.choice(starts, nb)
+    return (st[:, None] + np.arange(block)[None]).ravel()[:n]
+
+
+def block_bootstrap_f1(pred, true, block=200, n_boot=1000, alpha=0.05, seed=0, seg=None):
     """Moving-block bootstrap CI of macro-F1. Returns (point, lo, hi)."""
     pred, true = np.asarray(pred), np.asarray(true)
     n = len(true); rng = np.random.default_rng(seed)
-    nb = int(np.ceil(n / block)); starts_max = max(n - block, 1)
     vals = np.empty(n_boot)
     for b in range(n_boot):
-        st = rng.integers(0, starts_max, nb)
-        idx = (st[:, None] + np.arange(block)[None]).ravel()[:n]
+        idx = _block_indices(n, block, rng, seg)
         vals[b] = _macro_f1(pred[idx], true[idx])
     return _macro_f1(pred, true), float(np.quantile(vals, alpha / 2)), float(np.quantile(vals, 1 - alpha / 2))
 
 
-def paired_bootstrap_diff(pred_a, pred_b, true, block=200, n_boot=1000, seed=0):
+def paired_bootstrap_diff(pred_a, pred_b, true, block=200, n_boot=1000, seed=0, seg=None):
     """CI of F1(a) - F1(b) on the same resampled blocks. Difference is significant if CI excludes 0."""
     pred_a, pred_b, true = map(np.asarray, (pred_a, pred_b, true))
-    n = len(true); rng = np.random.default_rng(seed); nb = int(np.ceil(n / block)); sm = max(n - block, 1)
+    n = len(true); rng = np.random.default_rng(seed)
     d = np.empty(n_boot)
     for b in range(n_boot):
-        idx = (rng.integers(0, sm, nb)[:, None] + np.arange(block)[None]).ravel()[:n]
+        idx = _block_indices(n, block, rng, seg)
         d[b] = _macro_f1(pred_a[idx], true[idx]) - _macro_f1(pred_b[idx], true[idx])
     return float(d.mean()), float(np.quantile(d, 0.025)), float(np.quantile(d, 0.975))
 

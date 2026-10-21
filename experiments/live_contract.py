@@ -16,12 +16,13 @@ from pathlib import Path
 
 import numpy as np
 
-CONTRACT_KEYS = ("seq_len", "n_features", "feature_source", "normalisation", "market")
+CONTRACT_KEYS = ("seq_len", "n_features", "feature_source", "normalisation", "market", "protocol")
 
 
 def make_contract(seq_len: int, n_features: int, feature_source: str, normalisation: str, market: str) -> dict:
+    from qspinn_core import PROTOCOL_VERSION
     return dict(seq_len=seq_len, n_features=n_features, feature_source=feature_source,
-                normalisation=normalisation, market=market)
+                normalisation=normalisation, market=market, protocol=PROTOCOL_VERSION)
 
 
 def save_contract(path: Path, contract: dict) -> None:
