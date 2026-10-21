@@ -75,6 +75,15 @@ def rolling_vol_score(mid: np.ndarray, window: int = 20) -> np.ndarray:
     return out
 
 
+def segmented_rolling_vol(mid: np.ndarray, seg: np.ndarray, window: int = 20) -> np.ndarray:
+    """Causal rolling vol computed independently inside each stock/day segment (never across a join)."""
+    out = np.zeros(len(mid))
+    for s_ in np.unique(seg):
+        ii = np.flatnonzero(seg == s_)
+        out[ii] = rolling_vol_score(mid[ii], window)
+    return out
+
+
 def select_threshold(val_scores: np.ndarray, fraction: float) -> float:
     """
     Budget-safe threshold chosen on VALIDATION scores only.  Policy for ties: the routed set is

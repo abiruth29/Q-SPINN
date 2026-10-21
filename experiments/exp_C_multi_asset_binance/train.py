@@ -390,11 +390,11 @@ class MultiAssetQSPINN(nn.Module):
         return self.head(feats)
 
     @torch.no_grad()
-    def infer(self, spikes, x, dt_seq, chunk=4096):
+    def infer(self, spikes, x, dt_seq, chunk=4096, sel=None):
         """Deployed conditional inference: heavy expert only on gate-selected rows."""
         self.eval()
         cheap, g, _, _ = self.gate(spikes, dt_seq)
-        sel = g > 0.5
+        sel = (g > 0.5) if sel is None else sel      # `sel` override is for latency sweeps at a fixed routing fraction
         out = cheap.clone()
         idx = torch.nonzero(sel, as_tuple=False).squeeze(1)
         for i in range(0, len(idx), chunk):

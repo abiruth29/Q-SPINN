@@ -8,7 +8,8 @@ Produces routing_study_k{H}_s{S}.json with:
   * validation macro-F1 vs routing fraction for: learned gate, confidence cascade, rolling-vol,
     benefit head (and random); the fraction is chosen on VALIDATION only
   * the same routers evaluated on TEST at that fixed validation threshold
-  * true conditional-inference latency (heavy called only on selected rows) vs dense heavy
+  * matched full-pipeline latency (raw windows in -> logits out, eval/no_grad, same chunking and warm-up):
+    cheap-only, dense heavy, and the real conditional hybrid (learned gate and forced routing fractions)
 No test label is used to choose any threshold.
 """
 import argparse, json, sys
@@ -31,7 +32,7 @@ def collect(model, X, dt, device, bs=1024):
         xb = X[i:i + bs].to(device).contiguous(); db = dt[i:i + bs].to(device).contiguous()
         sp = model.encode(xb)
         cheap, g, rate, gl = model.gate(sp, db)
-        heavy = model.heavy_path(xb)[0]
+        heavy = model.heavy_infer(xb)
         C.append(cheap.cpu()); Hh.append(heavy.cpu()); G.append(gl.reshape(len(xb), -1)[:, 0].cpu())
         F.append(torch.stack([sp.float().mean((1, 2)), sp.float().abs().sum((1, 2))], 1).cpu())
     return torch.cat(C), torch.cat(Hh), torch.cat(G).numpy(), torch.cat(F).numpy()
@@ -65,13 +66,16 @@ def main():
     # routers: score higher => route to heavy
     head = R.fit_benefit_head(data["train"]["f"], R.benefit_targets(data["train"]["c"], data["train"]["h"],
                                                                     torch.tensor(data["train"]["y"])).numpy())
-    def mid(k):  # last-step mid price for the rolling-vol baseline (causal)
-        return ((data[k]["X"][:, -1, 0] + data[k]["X"][:, -1, 2]) / 2).numpy()
+    from qspinn_core import window_starts
+    def rv_at_windows(k):    # causal rolling vol per stock/day segment, sampled at each window's last row
+        Xr, sg = d[k]["X"], d[k]["seg"]
+        last = window_starts(len(Xr), T.SEQ_LEN, sg, a.horizon) + T.SEQ_LEN - 1
+        return R.segmented_rolling_vol((Xr[:, 0] + Xr[:, 2]) / 2.0, sg)[last]
     rng = np.random.default_rng(a.seed)
     scores = {
         "learned_gate": lambda k: data[k]["g"],
         "confidence_cascade": lambda k: R.confidence_score(data[k]["c"]).numpy(),
-        "rolling_vol": lambda k: R.rolling_vol_score(mid(k)),
+        "rolling_vol": lambda k: rv_at_windows(k),
         "benefit_head": lambda k: R.apply_benefit_head(data[k]["f"], head),
         "random": lambda k: rng.random(len(data[k]["y"])),
     }
@@ -87,14 +91,30 @@ def main():
     report["test_cheap_f1"] = R._macro_f1(data["test"]["cp"], data["test"]["y"])
     report["test_dense_f1"] = R._macro_f1(data["test"]["hp"], data["test"]["y"])
 
-    # conditional inference latency (task 09)
-    Xte = data["test"]["X"][:20000].to(device); cheap = data["test"]["c"][:20000].to(device)
-    sel = torch.from_numpy(scores["learned_gate"]("test")[:20000] >= report["routers"]["learned_gate"]["val_threshold"]).to(device)
-    heavy_fn = lambda xb: model.heavy_path(xb)[0]
-    report["latency_s"] = dict(
-        dense_heavy=R.timed(lambda: heavy_fn(Xte), device=device),
-        conditional=R.timed(lambda: R.conditional_infer(cheap, sel, heavy_fn, Xte), device=device),
-        routed_fraction=float(sel.float().mean()), device=str(device))
+    # Matched FULL-PIPELINE latency (review: same input prep, same chunking, eval + no_grad, warm-up, device sync).
+    # Every pipeline starts from the same raw CPU windows and includes host->device copy, encoding and (where
+    # applicable) the gate, so cheap / dense-heavy / hybrid are directly comparable.
+    N = min(20000, len(data["test"]["X"])); BS = 1024
+    Xraw = data["test"]["X"][:N]; DT = torch.ones(1, T.SEQ_LEN).expand(N, T.SEQ_LEN)
+    def run(kind, frac=None):
+        with torch.no_grad():
+            for i in range(0, N, BS):
+                xb = Xraw[i:i + BS].to(device).contiguous(); db = DT[i:i + BS].to(device).contiguous()
+                if kind == "dense_heavy":
+                    model.heavy_infer(xb)
+                else:
+                    sp = model.encode(xb)
+                    if kind == "cheap_only":
+                        model.gate(sp, db)
+                    else:   # hybrid: real conditional execution; `frac` forces a routing fraction, None = learned gate
+                        force = None if frac is None else (torch.arange(len(xb), device=device) < int(round(frac * len(xb))))
+                        model.infer(sp, xb, db, chunk=BS, sel=force)
+    lat = dict(device=str(device), n_windows=N, batch=BS, mode="eval+no_grad, cold-start excluded (2 warm-up runs)")
+    lat["cheap_only_s"] = R.timed(lambda: run("cheap_only"), device=device)
+    lat["dense_heavy_s"] = R.timed(lambda: run("dense_heavy"), device=device)
+    lat["hybrid_learned_gate_s"] = R.timed(lambda: run("hybrid"), device=device)
+    lat["hybrid_at_fraction_s"] = {str(f): R.timed(lambda f=f: run("hybrid", f), device=device) for f in (0.0, 0.1, 0.25, 0.5, 1.0)}
+    report["latency"] = lat
     out.write_text(json.dumps(report, indent=2)); log.info(f"wrote {out}")
 
 

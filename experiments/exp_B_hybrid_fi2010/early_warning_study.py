@@ -80,9 +80,7 @@ def main():
         y = (fv[k][last] > thr).astype(np.int64)
         Xw = torch.from_numpy(d[k]["X"]).unfold(0, T.SEQ_LEN, 1).transpose(1, 2)[st]
         mid = (d[k]["X"][:, 0] + d[k]["X"][:, 2]) / 2.0
-        rv = np.zeros(len(mid))             # causal rolling vol per segment, sampled at the window end
-        for s_ in np.unique(d[k]["seg"]):
-            ii = np.flatnonzero(d[k]["seg"] == s_); rv[ii] = R.rolling_vol_score(mid[ii])
+        rv = R.segmented_rolling_vol(mid, d[k]["seg"])   # causal, per stock/day segment
         P[k] = dict(y=y, last=last, omega=omega_scores(model, Xw, device), rv=rv[last])
     seg_te = d["test"]["seg"]
     onsets = R.realised_onsets(abs_ret(d["test"]["X"], seg_te), ev_thr, refractory=a.tau, seg=seg_te)

@@ -45,3 +45,10 @@ def test_blocks_never_cross_segments():
         idx = _block_indices(150, 20, rng, seg)
         blocks = idx[:140].reshape(-1, 20)
         assert all(len(set(seg[b])) == 1 for b in blocks)
+
+
+def test_segmented_rolling_vol_ignores_other_segments():
+    mid = np.r_[np.cumsum(np.full(50, .01)), 1000 + np.cumsum(np.full(50, .01))]   # huge join jump
+    seg = np.repeat([0, 1], 50)
+    rv = R.segmented_rolling_vol(mid, seg, 20)
+    assert rv.max() < 0.01 and rv[50] == 0.0            # the join itself never shows up as volatility
