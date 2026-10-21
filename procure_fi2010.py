@@ -13,7 +13,7 @@ def _require_manifest(segments):
         raise SystemExit(
             f"segment manifest not found: {segments}\n"
             "This file is NOT shipped with the repo: it must contain the VERIFIED row count of every stock/day segment,\n"
-            "format {\"train\": [42 counts], \"test_d8\": [5], \"test_d9\": [5], \"test_d10\": [5]}, each list summing to the\n"
+            "format {\"train\": [35 counts], \"test_d8\": [5], \"test_d9\": [5], \"test_d10\": [5]}, each list summing to the\n"
             "row count of its source file. The FI-2010 paper (arXiv 1705.03233) does NOT publish per-stock/day counts;\n"
             "look in the dataset README from the paper's footnote-4 link, or ask the dataset authors.\n"
             "Exploration only (training will REFUSE the result):  python procure_fi2010.py --setup2 --allow-heuristic")
