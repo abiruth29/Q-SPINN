@@ -425,6 +425,7 @@ def _batch_to_seconds(batch, time_col="time"):
 
 
 def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
+    """Raw per-second aggregates INDEXED BY UNIX SECOND (timestamps kept - Task 11)."""
     import pyarrow.parquet as pq   # lazy: unit tests don't need pyarrow
     import pandas as pd
     files = sorted(symbol_dir.rglob("*.parquet"))
@@ -444,42 +445,34 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
         if ticks_so_far >= max_ticks: break
 
     if not all_second_dfs: return None
-    combined = pd.concat(all_second_dfs).groupby(level=0).agg(_AGG_OPS).sort_index().reset_index(drop=True)
-    combined["mid_price"]    = combined["mid_sum"]  / combined["mid_count"].clip(lower=1)
-    combined["vwap"]         = combined["total_pq"] / combined["total_qty"].clip(lower=1e-8)
-    combined["log_return"]   = np.log(combined["mid_price"] / combined["mid_price"].shift(1).bfill())
-    combined["realized_vol"] = combined["log_return"].rolling(20, min_periods=1).std().fillna(0)
-    combined["buy_pressure"] = combined["buy_vol"] / (combined["buy_vol"] + combined["sell_vol"]).clip(lower=1e-8)
-    combined["vwap_spread"]  = (combined["vwap"] - combined["mid_price"]).abs() / combined["mid_price"].clip(lower=1e-8)
-    feats = combined[["log_return", "ofi", "realized_vol", "buy_pressure", "trade_count", "vwap_spread"]].values.astype(np.float32)
-    return feats[:max_ticks]
+    return pd.concat(all_second_dfs).groupby(level=0).agg(_AGG_OPS).sort_index()
 
 
 def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS):
-    log.section("Loading & Engineering 3-Asset Binance Trade Streams")
+    from binance_align import align_on_grid, frame_to_features, forward_labels
+    log.section("Loading & Engineering 3-Asset Binance Trade Streams (common 1 s clock)")
     syms = ["symbol=BTCUSDT", "symbol=ETHUSDT", "symbol=SOLUSDT"]
-    all_feats = []
+    raw = []
     for s in syms:
-        s_dir = DATA_DIR / s
         name = s.replace("symbol=", "")
         log.info(f"Streaming parquet chunks for {name}...")
-        f = engineer_features_for_symbol(s_dir, max_ticks)
-        all_feats.append(f)
-        log.info(f"  {name}: {len(f):,} 1s bins")
+        f = engineer_features_for_symbol(DATA_DIR / s, max_ticks)
+        raw.append(f)
+        log.info(f"  {name}: {len(f):,} non-empty seconds  [{f.index.min()} .. {f.index.max()}]")
 
-    min_len = min(len(f) for f in all_feats)
-    all_feats = [f[:min_len] for f in all_feats]
-    combined_feats = np.concatenate(all_feats, axis=1) # [min_len, 18]
+    aligned, grid = align_on_grid(raw)
+    all_feats = [frame_to_features(g) for g in aligned]
+    for s, g in zip(syms, aligned):
+        log.metric(f"{s.split('=')[1]} stale-second %", float(g["stale"].mean() * 100), unit="%")
+    n_len = len(grid)
+    combined_feats = np.concatenate(all_feats, axis=1)        # [n_len, 18]
 
-    # Primary predictive label: 5s forward return of BTCUSDT (3 classes)
-    mid_returns = all_feats[0][:, 0]
-    fut = np.convolve(mid_returns, np.ones(HORIZON) / HORIZON, mode="full")[HORIZON - 1:][:min_len]
-    shifted = np.concatenate([fut[HORIZON:], np.repeat(fut[-1], HORIZON)])
-    alpha_down = np.percentile(shifted, 33.33)
-    alpha_up   = np.percentile(shifted, 66.67)
-    labels = np.ones(min_len, dtype=np.int64)
-    labels[shifted > alpha_up] = 2
-    labels[shifted < alpha_down] = 0
+    # Primary label: mean BTC log-return over the NEXT HORIZON seconds, thresholds from the train span.
+    n_total = n_len - SEQ_LEN - HORIZON
+    train_end_row = int(n_total * TRAIN_FRAC) + SEQ_LEN
+    labels, (lo, hi) = forward_labels(all_feats[0][:, 0], HORIZON, train_end_row)
+    labels[labels < 0] = 1                                    # padded tail is never used (purged below)
+    log.info(f"Label thresholds (train-only): down < {lo:.3e}, up > {hi:.3e}")
 
     # 2σ realized-volatility regime mask on BTC
     import pandas as pd
@@ -488,7 +481,7 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
     sg = s.rolling(REGIME_WINDOW, min_periods=1).std().fillna(0)
     regime = ((s > mu + REGIME_SIGMA * sg)).astype(np.float32).values
 
-    log.metric("Total 1s bins", min_len)
+    log.metric("Total 1s bins", n_len)
     log.metric("Features", combined_feats.shape[1])
     log.metric("Regime %", float(regime.mean() * 100), unit="%")
     return combined_feats, labels, regime
