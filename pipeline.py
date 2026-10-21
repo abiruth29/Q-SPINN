@@ -17,25 +17,30 @@ from lob_extractor import FI2010Extractor
 from live_contract import make_contract, load_contract, contracts_match, LiveWindow
 from exp_B_hybrid_fi2010.train import SEQ_LEN, N_FEATURES
 
-# Initialize the Trained Q-SPINN (Exp B - FI-2010)
-# Forced to CPU for live inference to prevent background CUDA context crashes
-device = 'cpu'
-model = QSPINN().to(device)
+# Initialize the Q-SPINN.  Order matters (review item 10): decide on the input/protocol contract BEFORE loading
+# any tensors, and never load legacy weights into the current architecture.
+device = 'cpu'     # forced to CPU for live inference to prevent background CUDA context crashes
 ckpt_path = ROOT / "experiments" / "exp_B_hybrid_fi2010" / "qspinn_fi2010.pt"
-if ckpt_path.exists():
-    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-    print("✅ Successfully loaded trained FI-2010 weights!")
-else:
-    print("⚠️ Weights not found, using random initialization")
-model.eval()
-
-# Task 17: input contract.  The live extractor produces online-z-scored crypto features, the FI-2010
-# weights were trained on dataset-normalised equity features -> NOT a match.  Product inference needs
-# a model retrained on matched live inputs (a *_contract.json next to the weights); otherwise --demo.
 LIVE_CONTRACT = make_contract(SEQ_LEN, N_FEATURES, "binance_depth_extractor", "online_zscore", "crypto")
 TRAIN_CONTRACT = load_contract(ckpt_path.with_name("qspinn_fi2010_contract.json"))
 CONTRACT_OK, CONTRACT_MISMATCH = contracts_match(TRAIN_CONTRACT, LIVE_CONTRACT)
 MODE = "PRODUCTION" if CONTRACT_OK else "DEMONSTRATION (weights not trained on this input contract)"
+WEIGHTS_ERROR = None
+
+model = QSPINN().to(device)
+if not ckpt_path.exists():
+    WEIGHTS_ERROR = (f"no weights at {ckpt_path.name}. Legacy v3.0 weights are archived in experiments/legacy_v3.0/ "
+                     "and are NOT loadable (different generator/protocol). Train with v3.1 first.")
+elif TRAIN_CONTRACT is None or TRAIN_CONTRACT.get("protocol") != LIVE_CONTRACT["protocol"]:
+    WEIGHTS_ERROR = (f"weights have no matching contract/protocol (found {None if TRAIN_CONTRACT is None else TRAIN_CONTRACT.get('protocol')!r}, "
+                     f"need {LIVE_CONTRACT['protocol']!r}). Refusing to load them.")
+else:
+    try:
+        model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+        print("✅ Loaded protocol-matched weights")
+    except Exception as e:          # shape/key mismatch = wrong architecture version
+        WEIGHTS_ERROR = f"weights do not fit the current architecture: {type(e).__name__}: {str(e)[:200]}"
+model.eval()
 window = LiveWindow(SEQ_LEN, N_FEATURES)
 
 LOG_FILE = ROOT / "live_inference.jsonl"
@@ -115,6 +120,8 @@ async def main():
     parser.add_argument("--demo", action="store_true",
                         help="allow running with weights whose training contract does not match the live inputs")
     args = parser.parse_args()
+    if WEIGHTS_ERROR:
+        raise SystemExit(f"Refusing to run: {WEIGHTS_ERROR}")
     if not CONTRACT_OK and not args.demo:
         raise SystemExit("Refusing to run: training/live input contract mismatch on "
                          f"{CONTRACT_MISMATCH}. Retrain on matched live inputs, or pass --demo to run a "

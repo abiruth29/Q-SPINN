@@ -14,7 +14,7 @@ def _make_parquet(path, rng):
             df = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(144)])
             for c in ("label_k10", "label_k20", "label_k30", "label_k50", "label_k100"):
                 df[c] = rng.integers(0, 3, seg_len)
-            df["partition"] = name; df["segment_id"] = off + s; df["day_in_partition"] = s // 5
+            df["partition"] = name; df["provenance"] = "authoritative"; df["segment_id"] = off + s; df["day_in_partition"] = s // 5
             rows.append(df)
         return off + n_seg
     o = part("train", 10, 120, 0)

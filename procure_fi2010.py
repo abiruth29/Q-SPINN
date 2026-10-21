@@ -8,7 +8,7 @@ from pathlib import Path
 REFERENCE_DIR = Path("data/reference/fi2010")
 ZIP_PATH = REFERENCE_DIR / "BenchmarkDatasets.zip"
 
-def main(setup2=False):
+def main(setup2=False, segments=None, allow_heuristic=False):
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
     
     if not ZIP_PATH.exists():
@@ -49,7 +49,7 @@ def main(setup2=False):
                     z.extract(member, temp_dir)
                     
         if setup2:
-            _build_setup2(temp_dir)
+            _build_setup2(temp_dir, segments, allow_heuristic)
             return
 
         # 2. Parse the files
@@ -109,7 +109,7 @@ def main(setup2=False):
         print("Cleaning up scratch files...")
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-def _build_setup2(temp_dir):
+def _build_setup2(temp_dir, segments=None, allow_heuristic=False):
     """Setup 2: Train CF7 once + Test CF7/8/9, with recovered stock/day segments (see experiments/fi2010_setup2.py)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent / "experiments"))
     import fi2010_setup2 as f2
@@ -118,13 +118,21 @@ def _build_setup2(temp_dir):
     train = read(base / "NoAuction_Zscore_Training" / "Train_Dst_NoAuction_ZScore_CF_7.txt")
     tests = {name: read(base / "NoAuction_Zscore_Testing" / f"Test_Dst_NoAuction_ZScore_CF_{cf}.txt")
              for name, cf in f2.TEST_DAYS.items()}
-    frames = f2.build_setup2_frames(train, tests)
+    import json
+    lengths = json.loads(Path(segments).read_text()) if segments else None
+    frames = f2.build_setup2_frames(train, tests, segment_lengths=lengths, allow_heuristic=allow_heuristic)
     f2.save_setup2(frames, REFERENCE_DIR)
     for name, r in f2.audit(frames).items():
-        flag = "OK " if r["confident"] else "LOW-CONFIDENCE"
-        print(f"  [{flag}] {name}: rows={r['rows']:,} segments={r['n_segments']} confidence={r['boundary_confidence']:.2f}")
+        flag = "AUTHORITATIVE" if r["confident"] else "HEURISTIC-UNVERIFIED"
+        print(f"  [{flag}] {name}: rows={r['rows']:,} segments={r['n_segments']}")
     print(f"Wrote {REFERENCE_DIR/'fi2010_setup2.parquet'} and segment_audit.json - INSPECT the audit before training.")
 
 
 if __name__ == "__main__":
-    main(setup2="--setup2" in sys.argv)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--setup2", action="store_true")
+    ap.add_argument("--segments", default=None, help="JSON {partition: [per-stock/day row counts]} (authoritative)")
+    ap.add_argument("--allow-heuristic", action="store_true", help="exploration only; training will refuse the result")
+    a = ap.parse_args()
+    main(setup2=a.setup2, segments=a.segments, allow_heuristic=a.allow_heuristic)

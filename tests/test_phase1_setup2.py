@@ -26,17 +26,54 @@ def test_low_confidence_flagged_when_no_joins():
     assert conf < 1.5
 
 
-def test_frames_have_unique_ids_and_day_index():
+def _arr(n_seg, rng, seg_len=120):
+    m = _synthetic(n_seg, seg_len, rng)
+    a = np.zeros((len(m), 149)); a[:, 0] = m; a[:, 2] = m; a[:, 144:] = 1
+    return a
+
+
+def test_frames_require_authoritative_lengths_and_have_unique_ids():
+    import pytest
+    from fi2010_setup2 import segments_from_lengths
     rng = np.random.default_rng(2)
-    def arr(n_seg):
-        m = _synthetic(n_seg, 120, rng)
-        a = np.zeros((len(m), 149)); a[:, 0] = m; a[:, 2] = m; a[:, 144:] = 1
-        return a
-    fr = build_setup2_frames(arr(35), {"test_d8": arr(5), "test_d9": arr(5), "test_d10": arr(5)})
+    tr, t8, t9, t10 = _arr(35, rng), _arr(5, rng), _arr(5, rng), _arr(5, rng)
+    tests = {"test_d8": t8, "test_d9": t9, "test_d10": t10}
+    with pytest.raises(RuntimeError):                                  # fail closed without provenance
+        build_setup2_frames(tr, tests)
+    lens = {"train": [120] * 35, "test_d8": [120] * 5, "test_d9": [120] * 5, "test_d10": [120] * 5}
+    fr = build_setup2_frames(tr, tests, segment_lengths=lens)
     ids = [set(np.unique(f["seg"])) for f in fr.values()]
     assert all(not (a & b) for i, a in enumerate(ids) for b in ids[i + 1:])
-    assert fr["train"]["day"].max() == 6
+    assert fr["train"]["day"].max() == 6 and all(f["provenance"] == "authoritative" for f in fr.values())
     assert all(r["confident"] for r in audit(fr).values())
+    for bad in ([120] * 34, [120] * 34 + [119], [120] * 34 + [0]):    # wrong count / wrong coverage / non-positive
+        with pytest.raises(ValueError):
+            segments_from_lengths(bad, 35 * 120, 35)
+
+
+def test_heuristic_is_stamped_and_loader_refuses_it(tmp_path):
+    import pytest
+    pytest.importorskip("pyarrow")
+    from fi2010_setup2 import save_setup2, load_setup2
+    rng = np.random.default_rng(3)
+    tests = {"test_d8": _arr(5, rng), "test_d9": _arr(5, rng), "test_d10": _arr(5, rng)}
+    fr = build_setup2_frames(_arr(35, rng), tests, allow_heuristic=True)
+    assert all(f["provenance"] == "heuristic" for f in fr.values())
+    assert not any(r["confident"] for r in audit(fr).values())          # never "confident" without provenance
+    save_setup2(fr, tmp_path)
+    with pytest.raises(RuntimeError):
+        load_setup2(tmp_path / "fi2010_setup2.parquet", "label_k10")
+    assert len(load_setup2(tmp_path / "fi2010_setup2.parquet", "label_k10", allow_heuristic=True)["train"]["X"]) > 0
+
+
+def test_heuristic_misplaces_boundary_when_shock_exceeds_true_join():
+    """Review counterexample: in-session shock larger than the true (small) join -> wrong cut, high 'confidence'."""
+    rng = np.random.default_rng(0)
+    mid = np.cumsum(rng.normal(0, .001, 400))
+    mid[200:] += 0.05            # small TRUE join at row 200
+    mid[100:] += 5.0             # big in-session move at row 100
+    seg, conf = detect_segments(mid, 2)
+    assert np.flatnonzero(np.diff(seg))[0] + 1 == 100 and conf > 50     # confidently wrong -> why provenance is required
 
 
 def test_windows_never_cross_segments_and_purge_horizon():
