@@ -20,7 +20,7 @@ SWAP STATUS
 -----------
 SWAP-01: ✅ Real FI-2010 LOB data (NoAuction Z-score)
 SWAP-02: ✅ Pre-normalized by FI-2010 authors (no leakage)
-SWAP-03: ✅ Adaptive batch-volatility threshold for delta-encoding
+SWAP-03: ✅ Train-only per-feature delta thresholds (v3.1: SpikeEncoder, no batch dependence)
 SWAP-04: ✅ Learnable slope parameter (alpha) for arctan surrogate gradient
 SWAP-05: ✅ Highly optimized custom LIF layer with dynamic beta/alpha
 SWAP-08: ✅ Kendall et al. homoscedastic adaptive loss weighting
@@ -35,7 +35,6 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
-import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 
@@ -46,6 +45,8 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from device import get_device
 from logger import ExperimentLogger
 from checkpoint import save_checkpoint, load_checkpoint, guard_nan
+from qspinn_core import (StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
+                         stage_c_mode, heavy_teacher_ctx)
 
 # GPU Optimizations
 if torch.cuda.is_available():
@@ -74,6 +75,11 @@ LR            = 2e-3
 SEED          = 0
 LABEL_COL     = "label_k10"
 CKPT_PATH     = OUT_DIR / "checkpoint.pt"
+# Task 02: covariance (Van Loan + cov_head) is OFF until a defensible innovation
+# likelihood exists.  Set QSPINN_USE_COV=1 to re-enable for experimentation only.
+import os
+USE_COVARIANCE = os.environ.get("QSPINN_USE_COV", "0") == "1"
+MAX_GRAD_NORM = 1.0          # Task 01
 
 
 # ── surrogate gradient ────────────────────────────────────────────────────────
@@ -314,8 +320,11 @@ class SNNGate(nn.Module):
 
 # ── full Q-SPINN ──────────────────────────────────────────────────────────────
 class QSPINN(nn.Module):
-    def __init__(self, n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS):
+    def __init__(self, n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS, use_cov=None):
         super().__init__()
+        self.use_cov = USE_COVARIANCE if use_cov is None else use_cov
+        self.heavy_frozen = False      # Task 03: set by stage_c_mode
+        self.encoder = SpikeEncoder(n_in)   # Task 04: fitted on TRAIN only
         self.gate = SNNGate(n_in=n_in)
         self.amp  = ComplexAmplitudeLayer(n_in=n_in, d=d, n_assets=n_assets)
         self.ham  = HamiltonianNet(n_in=n_in, d=d, n_assets=n_assets)
@@ -333,7 +342,6 @@ class QSPINN(nn.Module):
         
         # SWAP-08: Adaptive loss weighting parameters
         self.log_var_ce     = nn.Parameter(torch.tensor(0.0))
-        self.log_var_gate   = nn.Parameter(torch.tensor(0.0))
         self.log_var_regime = nn.Parameter(torch.tensor(0.0))
 
     def heavy_path(self, x):
@@ -352,15 +360,15 @@ class QSPINN(nn.Module):
         A_R_mat = S_tot + H_I
         A_I_mat = -H_R
         
-        A_block = torch.zeros(B, 2 * N, 2 * N, device=x.device, dtype=torch.float32)
-        A_block[:, :N, :N] = A_R_mat
-        A_block[:, :N, N:] = -A_I_mat
-        A_block[:, N:, :N] = A_I_mat
-        A_block[:, N:, N:] = A_R_mat
-        
-        # Exact Van Loan Covariance Propagation (V3-02 & V3-03)
-        F, Q_h = self.van_loan(A_block, DT)
-        
+        if self.use_cov:
+            A_block = torch.zeros(B, 2 * N, 2 * N, device=x.device, dtype=torch.float32)
+            A_block[:, :N, :N] = A_R_mat
+            A_block[:, :N, N:] = -A_I_mat
+            A_block[:, N:, :N] = A_I_mat
+            A_block[:, N:, N:] = A_R_mat
+            
+            F, Q_h = self.van_loan(A_block, DT)
+
         # Continuous-Time Mean Integration via Matrix Exponential
         U = torch.matrix_exp(-1j * H_tot * DT)
         
@@ -368,15 +376,15 @@ class QSPINN(nn.Module):
         psi_pred = torch.einsum('bij,btj->bti', U, psi[:, :-1])
         L_pde    = (psi[:, 1:] - psi_pred).abs().pow(2).mean()
         
-        # Covariance Residual Consistency Loss (V3-04)
-        z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
-        Sigma_theta_flat = self.cov_head(z_T)
-        Sigma_theta = Sigma_theta_flat.view(B, 2 * N, 2 * N)
-        Sigma_theta = Sigma_theta @ Sigma_theta.transpose(-1, -2) # PSD constraint
-        
-        # Discrete-time covariance residual
-        R_Sigma = F @ Sigma_theta @ F.transpose(-1, -2) + Q_h - Sigma_theta
-        L_cov = R_Sigma.abs().pow(2).mean()
+        if self.use_cov:
+            z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
+            Sigma_theta = self.cov_head(z_T).view(B, 2 * N, 2 * N)
+            Sigma_theta = Sigma_theta @ Sigma_theta.transpose(-1, -2)  # PSD
+            R_Sigma = F @ Sigma_theta @ F.transpose(-1, -2) + Q_h - Sigma_theta
+            L_cov = R_Sigma.abs().pow(2).mean()
+        else:
+            L_cov = torch.zeros((), device=x.device)
+
         # Norm-Balance Residual Loss (V3-05)
         # Empirical finite-difference derivative of the squared norm
         norm_sq_t1 = psi[:, 1:].abs().pow(2).sum(dim=-1)
@@ -413,16 +421,24 @@ class QSPINN(nn.Module):
             H0 = torch.zeros(1, PSI_DIM, PSI_DIM, dtype=torch.cfloat, device=spikes.device)
             S0 = torch.zeros(1, PSI_DIM, PSI_DIM, dtype=torch.float32, device=spikes.device)
             return cheap, torch.zeros_like(g), rate, torch.zeros((), device=spikes.device), H0, S0, gl, torch.zeros((), device=spikes.device), torch.zeros((), device=spikes.device)
-        heavy, L_pde, H, S, L_cov, L_norm = self.heavy_path(x)
+        if self.heavy_frozen:                      # Task 03: fixed teacher
+            with heavy_teacher_ctx():
+                heavy, L_pde, H, S, L_cov, L_norm = self.heavy_path(x)
+        else:
+            heavy, L_pde, H, S, L_cov, L_norm = self.heavy_path(x)
         if mode == "dense":
             return heavy, torch.ones_like(g), rate, L_pde, H, S, gl, L_cov, L_norm
-        gm = (torch.sigmoid(gl) * g).unsqueeze(-1)
-        return gm * heavy + (1 - gm) * cheap, g, rate, L_pde, H, S, gl, L_cov, L_norm
+        # Task 05: binary gate selects one expert's logits exactly (no attenuation)
+        return route_exact(cheap, heavy, g), g, rate, L_pde, H, S, gl, L_cov, L_norm
+
+    def encode(self, x):
+        return self.encoder(x)
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
 def load_fi2010(log: ExperimentLogger, label_col=LABEL_COL):
     log.section(f"Loading FI-2010 (NoAuction Z-Score, {label_col})")
+    import pyarrow.parquet as pq   # lazy: unit tests don't need pyarrow
     t0  = time.time()
     tbl = pq.read_table(ROOT / "data" / "reference" / "fi2010" / "fi2010_noauction_zscore.parquet")
     df  = tbl.to_pandas()
@@ -465,29 +481,23 @@ def build_regime_mask(feats: np.ndarray) -> np.ndarray:
     return regime
 
 
-def delta_encode(x, alpha=1.5):
-    d        = torch.zeros_like(x)
-    d[:, 1:] = x[:, 1:] - x[:, :-1]
-    # Adaptive threshold based on batch mean absolute deviation
-    threshold = d.abs().mean(dim=(0, 1), keepdim=True) * alpha
-    return torch.cat([(d > threshold).float(), (d < -threshold).float()], dim=-1)
-
-
-def make_windows_from_array(X, y, regime):
-    """Zero-memory sliding windows on CPU using PyTorch unfold."""
+def make_windows_from_array(X, y, regime, seg_id=None, horizon=0):
+    """
+    Sliding windows on CPU.  Task 04/06: dt is the fixed event-index step (1.0),
+    not random noise; the last valid window is included (no off-by-one).
+    With `seg_id` (per-row stock/day id) windows never straddle segments and the
+    last `horizon` rows of a segment are purged (Task 07).
+    """
+    from qspinn_core import window_starts
     Xt = torch.from_numpy(X)
     yt = torch.from_numpy(y)
     rt = torch.from_numpy(regime)
-    dt = torch.empty(len(X), dtype=torch.float32).exponential_(10.0)
-    
-    # unfold(dim, size, step) creates a strided view without allocating memory
     Xw = Xt.unfold(0, SEQ_LEN, 1).transpose(1, 2)
-    dt_w = dt.unfold(0, SEQ_LEN, 1)
     rw = rt.unfold(0, SEQ_LEN, 1).max(dim=1)[0]
-    yw = yt[SEQ_LEN - 1:]
-    
-    n = len(X) - SEQ_LEN
-    return Xw[:n], yw[:n], rw[:n], dt_w[:n]
+    starts = torch.from_numpy(window_starts(len(X), SEQ_LEN, seg_id, horizon))
+    yw = yt[starts + SEQ_LEN - 1]
+    dt_w = torch.ones(1, SEQ_LEN).expand(len(starts), SEQ_LEN)
+    return Xw[starts], yw, rw[starts], dt_w
 
 
 # ── metrics ───────────────────────────────────────────────────────────────────
@@ -509,7 +519,7 @@ def eval_stage_A(model, Xva, yva, dt_va, device, batch_size=1024):
         for i in range(0, len(Xva), batch_size):
             Xb = Xva[i:i+batch_size].to(device).contiguous()
             dt_b = dt_va[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             c, _, _, _ = model.gate(Sb, dt_b)
             preds.append(c.argmax(1).cpu())
     return macro_f1(torch.cat(preds), yva.cpu())
@@ -530,9 +540,10 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
     best       = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "A" else -1.0
     snap       = ckpt.get("best_state")    if ckpt and ckpt.get("stage") == "A" else None
     if ckpt and ckpt.get("stage") == "A":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
 
     for ep in range(start_ep, epochs):
         model.train()
@@ -542,15 +553,16 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             b = perm[i:i + batch_size]
             Xb = Xtr[b].to(device).contiguous()
             dt_b = dt_tr[b].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             yb = ytr[b].to(device).contiguous()
             
             cheap, _, rate, _ = model.gate(Sb, dt_b)
             loss = ce(cheap, yb) + 1e-4 * rate
-            opt.zero_grad(); loss.backward(); opt.step()
-            
-            if guard_nan(loss, ep + 1, "A", log):
+            guard.step(loss, params, opt)
+            if guard.halt:
+                log.warn(f"Stage A: {guard.consecutive} consecutive non-finite updates skipped; halting.")
                 nan_hit = True; break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
             
         if nan_hit:
@@ -568,14 +580,14 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, eta_s=eta)
 
     if snap is not None:
-        model.load_state_dict(snap)
+        load_state_compat(model, snap)
     
     # Final eval for metrics
     model.eval()
     with torch.no_grad():
         Xb = Xva[:1024].to(device).contiguous()
         dt_b = dt_va[:1024].to(device).contiguous()
-        _, _, r, _ = model.gate(delta_encode(Xb), dt_b)
+        _, _, r, _ = model.gate(model.encode(Xb), dt_b)
     log.stage("Stage A done", {"val_F1": eval_stage_A(model, Xva, yva, dt_va, device, batch_size=batch_size), "spike_rate": r.item()})
     return model
 
@@ -608,12 +620,13 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
     best       = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "B" else -1.0
     snap       = ckpt.get("best_state")    if ckpt and ckpt.get("stage") == "B" else None
     if ckpt and ckpt.get("stage") == "B":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         try:
             opt_heavy.load_state_dict(ckpt["optimizer"]["heavy"])
         except:
             log.info("Could not load split optimizer state from legacy checkpoint. Starting fresh optimizers.")
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
 
     for ep in range(start_ep, epochs):
         model.train()
@@ -639,12 +652,11 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             loss_head = ce(heavy, yb)
             loss = loss_phys + loss_head
             
-            opt_heavy.zero_grad()
-            loss.backward()
-            opt_heavy.step()
-            
-            if guard_nan(loss, ep + 1, "B", log):
+            guard.step(loss, params_heavy, opt_heavy)
+            if guard.halt:
+                log.warn(f"Stage B: {guard.consecutive} consecutive non-finite updates skipped; halting.")
                 nan_hit = True; break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
             
         if nan_hit:
@@ -662,7 +674,7 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, eta_s=eta)
 
     if snap is not None:
-        model.load_state_dict(snap)
+        load_state_compat(model, snap)
     
     # Final eval for metrics
     model.eval()
@@ -675,22 +687,24 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
 
 def eval_stage_C(model, Xva, yva, dt_va, device, batch_size=1024):
     model.eval()
-    preds, gates = [], []
+    preds, meter = [], RateMeter()
     with torch.no_grad():
         for i in range(0, len(Xva), batch_size):
             Xb = Xva[i:i+batch_size].to(device).contiguous()
             dt_b = dt_va[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             lo, g, _, _, _, _, _, _, _ = model(Sb, Xb, dt_b)
             preds.append(lo.argmax(1).cpu())
-            gates.append(g.mean().cpu())
+            meter.update(g)
     f1 = macro_f1(torch.cat(preds), yva.cpu())
-    return f1, torch.tensor(gates).mean().item()
+    return f1, meter.rate
 
 
 def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
     log.section(f"Stage C — Gate head arbitration  ({epochs} epochs)")
-    params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_gate, model.log_var_regime]
+    gate_params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_regime]
+    params = stage_c_mode(model, gate_params)   # Task 03: heavy frozen + eval + no-grad teacher
+    model.heavy_frozen = True
     opt  = torch.optim.Adam(params, lr=5e-3)
     ce   = nn.CrossEntropyLoss()
     pos_weight = torch.tensor([15.0]).to(device)
@@ -701,19 +715,20 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
     best_score = ckpt.get("best_f1", -1e9) if ckpt and ckpt.get("stage") == "C" else -1e9
     snap       = ckpt.get("best_state")    if ckpt and ckpt.get("stage") == "C" else {k: v.clone() for k, v in model.state_dict().items()}
     if ckpt and ckpt.get("stage") == "C":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
 
     for ep in range(start_ep, epochs):
-        model.train()
+        model.eval()   # Task 03: no HamiltonianNet sampling noise in Stage C
         perm = torch.randperm(len(Xtr))
         ep_loss, nan_hit = 0.0, False
         for i in range(0, len(Xtr), batch_size):
             b = perm[i:i + batch_size]
             Xb = Xtr[b].to(device).contiguous()
             dt_b = dt_tr[b].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             yb = ytr[b].to(device).contiguous()
             rb = rtr[b].to(device).contiguous()
             
@@ -732,10 +747,11 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             # Sparsity enforcement: penalize gate rates over 10%
             loss_gate_target = torch.relu(loss_gate - 0.10) * 5.0 + 0.2 * loss_gate
             loss = adaptive_ce + adaptive_regime + loss_gate_target
-            opt.zero_grad(); loss.backward(); opt.step()
-            
-            if guard_nan(loss, ep + 1, "C", log):
+            guard.step(loss, params, opt)
+            if guard.halt:
+                log.warn(f"Stage C: {guard.consecutive} consecutive non-finite updates skipped; halting.")
                 nan_hit = True; break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
         if nan_hit:
             break
@@ -757,13 +773,14 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
                       val_f1=f1, extra={"gate": gate_rate}, eta_s=eta)
 
     if snap is not None:
-        model.load_state_dict(snap)
+        load_state_compat(model, snap)
     return model
 
 
 def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
     model.eval()
-    preds, gates, rates, pdes, omegas = [], [], [], [], []
+    preds, rates, pdes, omegas = [], [], [], []
+    meter = RateMeter()
     H_herm_max = 0.0
     device = next(model.parameters()).device
     
@@ -771,10 +788,10 @@ def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
         for i in range(0, len(X), batch_size):
             Xb = X[i:i+batch_size].to(device).contiguous()
             dt_b = dt_w[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             logits, g, rate, L_pde, H, S, _, _, _ = model(Sb, Xb, dt_b, mode)
             preds.append(logits.argmax(1).cpu())
-            gates.append(g.mean().cpu())
+            meter.update(g)
             rates.append(rate.cpu())
             pdes.append(L_pde.cpu())
             
@@ -791,7 +808,7 @@ def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
     return dict(
         acc      = (pred == y.cpu()).float().mean().item(),
         f1       = macro_f1(pred, y.cpu()),
-        gate     = torch.tensor(gates).mean().item(),
+        gate     = meter.rate,
         spike    = torch.tensor(rates).mean().item(),
         pde      = torch.tensor(pdes).mean().item(),
         herm     = H_herm_max,
@@ -970,6 +987,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
 
     try:
         model = QSPINN().to(device)
+        model.encoder.fit(Xtr_np)   # Task 04: train-only thresholds, same encoder for val/test
         ckpt = load_checkpoint(ckpt_path, log)
         current_stage = ckpt["stage"] if ckpt else None
         
