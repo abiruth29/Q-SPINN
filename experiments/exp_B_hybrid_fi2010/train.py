@@ -45,7 +45,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from device import get_device
 from logger import ExperimentLogger
 from checkpoint import save_checkpoint, load_checkpoint, guard_nan
-from qspinn_core import (propagate, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
+from qspinn_core import (propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
                          StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
                          stage_c_mode, heavy_teacher_ctx)
 
@@ -81,6 +81,7 @@ CKPT_PATH     = OUT_DIR / "checkpoint.pt"
 import os
 USE_COVARIANCE = os.environ.get("QSPINN_USE_COV", "0") == "1"
 # v3.1 generator settings (Tasks 08-10)
+LAMBDA_SCALE = float(os.environ.get("QSPINN_LAMBDA_SCALE", "1.0"))   # weight of the scale anchor (0 disables = ablation)
 RESIDUAL_MODE = os.environ.get("QSPINN_RESIDUAL", "last")   # 'last' (causal) | 'all' (legacy ablation)
 H_FRO_MAX = 2.0     # spectral control on H
 S_FRO_MAX = 1.0     # spectral control on S (growth per step <= e^1)
@@ -400,7 +401,7 @@ class QSPINN(nn.Module):
         else:
             L_cov = torch.zeros((), device=x.device)
 
-        L_norm = L_norm_
+        L_norm = L_norm_ + LAMBDA_SCALE * scale_anchor(psi)   # norm balance + window-level non-collapse anchor
 
         psi_T    = ComplexAmplitudeLayer.normalise(psi[:, -1])
         psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))

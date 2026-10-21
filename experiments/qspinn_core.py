@@ -243,6 +243,20 @@ def window_starts(n_rows: int, seq_len: int, seg_id: Optional[np.ndarray] = None
 # ──────────────────────────────────────────────────────────────────────────────
 # 08-10  Single stable generator A = S - iH for the whole heavy path
 # ──────────────────────────────────────────────────────────────────────────────
+SCALE_FLOOR = 1e-20     # numerical floor only; far below any representable-collapse scale used in tests
+
+
+def scale_anchor(psi: torch.Tensor) -> torch.Tensor:
+    """
+    Non-collapse anchor: (log mean_t ||psi_t||^2)^2  ->  0 when the window-mean squared norm is 1.
+    A WINDOW-LEVEL data anchor, not a per-step unit-norm constraint (individual steps may grow/decay,
+    which is exactly what S != 0 expresses).  Without it the normalised read-out is blind to the global
+    scale and the physics penalties can be minimised by shrinking psi.
+    """
+    m = psi.abs().pow(2).sum(-1).mean(dim=1).clamp_min(SCALE_FLOOR)
+    return torch.log(m).pow(2).mean()
+
+
 GENERATOR_VERSION = 2   # v1 = S tied to Re(H) and exp(-iH dt); old checkpoints are LEGACY
 
 
@@ -296,9 +310,12 @@ def propagate(psi: torch.Tensor, H: torch.Tensor, S: torch.Tensor, dt: float = 1
     else:
         raise ValueError(f"residual must be 'last' or 'all', got {residual!r}")
     pred = torch.einsum("bij,btj->bti", U_res, p0)
-    L_pde = (p1 - pred).abs().pow(2).mean()
+    # RELATIVE residual: scale-invariant, so shrinking the latent scale no longer lowers it
+    # (review: scale 1e-6 made the absolute residual 4e-13 while logits barely moved).
+    res = (p1 - pred).abs().pow(2).sum(-1)
+    L_pde = (res / (0.5 * (p0.abs().pow(2).sum(-1) + p1.abs().pow(2).sum(-1))).clamp_min(SCALE_FLOOR)).mean()
     UhU = U_res.conj().transpose(-1, -2) @ U_res
-    n0 = p0.abs().pow(2).sum(-1).clamp_min(1e-8)
+    n0 = p0.abs().pow(2).sum(-1).clamp_min(SCALE_FLOOR)
     target = torch.einsum("bti,bij,btj->bt", p0.conj(), UhU, p0).real / n0 - 1.0
     obs = p1.abs().pow(2).sum(-1) / n0 - 1.0
     L_norm = (obs - target).pow(2).mean()
