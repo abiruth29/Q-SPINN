@@ -45,7 +45,8 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from device import get_device
 from logger import ExperimentLogger
 from checkpoint import save_checkpoint, load_checkpoint, guard_nan
-from qspinn_core import (StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
+from qspinn_core import (propagate, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
+                         StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
                          stage_c_mode, heavy_teacher_ctx)
 
 # GPU Optimizations
@@ -79,6 +80,10 @@ CKPT_PATH     = OUT_DIR / "checkpoint.pt"
 # likelihood exists.  Set QSPINN_USE_COV=1 to re-enable for experimentation only.
 import os
 USE_COVARIANCE = os.environ.get("QSPINN_USE_COV", "0") == "1"
+# v3.1 generator settings (Tasks 08-10)
+RESIDUAL_MODE = os.environ.get("QSPINN_RESIDUAL", "last")   # 'last' (causal) | 'all' (legacy ablation)
+H_FRO_MAX = 2.0     # spectral control on H
+S_FRO_MAX = 1.0     # spectral control on S (growth per step <= e^1)
 MAX_GRAD_NORM = 1.0          # Task 01
 
 
@@ -148,7 +153,8 @@ class ComplexAmplitudeLayer(nn.Module):
         return psi / n.to(psi.dtype)
 
     def forward(self, x):
-        return self.normalise(torch.complex(self.to_real(x), self.to_imag(x)))
+        # v3.1 (Task 09): dynamical state stays UNNORMALISED; readout normalises a copy.
+        return torch.complex(self.to_real(x), self.to_imag(x))
 
     @staticmethod
     def density_features(psi):
@@ -168,7 +174,7 @@ class HamiltonianNet(nn.Module):
         self.n_assets = n_assets
         
         # Output: mu (2 * d * d per asset) + Graph Adjacency A (N*N) + Graph Flux Phi (N*N)
-        out_dim = (n_assets * 2 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
+        out_dim = (n_assets * 3 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
         self.net = nn.Sequential(nn.Linear(n_in, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, out_dim))
         
         # Ornstein-Uhlenbeck / Kalman Filter stochastic parameters
@@ -192,11 +198,11 @@ class HamiltonianNet(nn.Module):
             v_t = velocities[:, t, :]
             out = self.net(v_t)
             
-            mu_raw = out[:, :self.n_assets * 2 * self.d * self.d]
-            mu_t  = mu_raw.view(B, self.n_assets, 2, self.d, self.d)
+            mu_raw = out[:, :self.n_assets * 3 * self.d * self.d]
+            mu_t  = mu_raw.view(B, self.n_assets, 3, self.d, self.d)
             
             if t == seq_len - 1:
-                idx_A = self.n_assets * 2 * self.d * self.d
+                idx_A = self.n_assets * 3 * self.d * self.d
                 idx_Phi = idx_A + self.n_assets * self.n_assets
                 A_raw   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
                 Phi_raw = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
@@ -218,13 +224,11 @@ class HamiltonianNet(nn.Module):
         else:
             z_final = z_t
             
-        A_local = torch.complex(z_final[:, :, 0], z_final[:, :, 1])
-        H_local = 0.5 * (A_local + A_local.conj().transpose(-1, -2))
-        
-        # S_local: symmetric component for local non-Hermitian expansion/contraction (Eq 27.2)
-        R_local = z_final[:, :, 0]
-        S_local = 0.5 * (R_local + R_local.transpose(-1, -2))
-        
+        # v3.1 (Task 08): S and H are INDEPENDENT.  channel 0 -> S (real symmetric, gain/loss),
+        # channels 1,2 -> Re/Im of H (Hermitian, conservative).  Previously S was Re(H).
+        S_local = symmetric_from_raw(z_final[:, :, 0])
+        H_local = hermitian_from_raw(z_final[:, :, 1], z_final[:, :, 2])
+
         if self.n_assets == 1:
             H_tot = H_local[:, 0]
             S_tot = S_local[:, 0]
@@ -253,7 +257,7 @@ class HamiltonianNet(nn.Module):
                     else:
                         H_tot[:, si:ei, sj:ej] = L[:, i, j].view(B, 1, 1) * I_d
                         
-        return self.scale * H_tot, self.scale * S_tot
+        return (bound_fro(self.scale * H_tot, H_FRO_MAX), bound_fro(self.scale * S_tot, S_FRO_MAX))
 
 
 # ── Van Loan Exact Covariance Propagator ─────────────────────────────────────
@@ -345,7 +349,6 @@ class QSPINN(nn.Module):
         self.log_var_regime = nn.Parameter(torch.tensor(0.0))
 
     def heavy_path(self, x):
-        psi        = self.amp(x)
         # Pass the entire sequence of velocities to the Kalman Filter
         velocities = x[:, 1:] - x[:, :-1]
         H_tot, S_tot = self.ham(velocities)
@@ -369,13 +372,10 @@ class QSPINN(nn.Module):
             
             F, Q_h = self.van_loan(A_block, DT)
 
-        # Continuous-Time Mean Integration via Matrix Exponential
-        U = torch.matrix_exp(-1j * H_tot * DT)
-        
-        # Propagate all states in the window exactly
-        psi_pred = torch.einsum('bij,btj->bti', U, psi[:, :-1])
-        L_pde    = (psi[:, 1:] - psi_pred).abs().pow(2).mean()
-        
+        # Task 09/10: ONE generator A = S - iH drives the means; residuals are causal ('last').
+        psi = self.amp(x)     # unnormalised dynamical state
+        U, L_pde, L_norm_ = propagate(psi, H_tot, S_tot, DT, RESIDUAL_MODE)
+
         if self.use_cov:
             z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
             Sigma_theta = self.cov_head(z_T).view(B, 2 * N, 2 * N)
@@ -385,29 +385,10 @@ class QSPINN(nn.Module):
         else:
             L_cov = torch.zeros((), device=x.device)
 
-        # Norm-Balance Residual Loss (V3-05)
-        # Empirical finite-difference derivative of the squared norm
-        norm_sq_t1 = psi[:, 1:].abs().pow(2).sum(dim=-1)
-        norm_sq_t0 = psi[:, :-1].abs().pow(2).sum(dim=-1)
-        d_norm_sq_dt = (norm_sq_t1 - norm_sq_t0) / DT
-        
-        # Theoretical prediction: 2 * Psi^\dagger * S * Psi
-        # psi[:, :-1] has shape [B, T-1, N]
-        # S_tot has shape [B, N, N]
-        # B x T-1 x N
-        psi_t0 = psi[:, :-1]
-        psi_t0_conj = psi_t0.conj()
-        S_tot_complex = S_tot.to(torch.complex64)
-        
-        # 2 \Psi^\dagger S \Psi (real because S is symmetric)
-        # We can use einsum: bti, bij, btj -> bt
-        theoretical_expansion = 2 * torch.einsum('bti,bij,btj->bt', psi_t0_conj, S_tot_complex, psi_t0).real
-        
-        R_norm = d_norm_sq_dt - theoretical_expansion
-        L_norm = R_norm.abs().pow(2).mean()
-        
-        psi_T    = psi[:, -1]
-        psi_next = torch.einsum('bij,bj->bi', U, psi_T)
+        L_norm = L_norm_
+
+        psi_T    = ComplexAmplitudeLayer.normalise(psi[:, -1])
+        psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))
         feats    = torch.cat([
             ComplexAmplitudeLayer.density_features(psi_T),
             ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),

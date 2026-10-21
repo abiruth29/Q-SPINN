@@ -228,3 +228,61 @@ def window_starts(n_rows: int, seq_len: int, seg_id: Optional[np.ndarray] = None
         seg_end = ends[np.searchsorted(ends, starts + seq_len - 1)]
         ok &= (starts + seq_len - 1 + horizon) <= seg_end
     return starts[ok]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 08-10  Single stable generator A = S - iH for the whole heavy path
+# ──────────────────────────────────────────────────────────────────────────────
+GENERATOR_VERSION = 2   # v1 = S tied to Re(H) and exp(-iH dt); old checkpoints are LEGACY
+
+
+def bound_fro(M: torch.Tensor, max_norm: float) -> torch.Tensor:
+    """Spectral control: rescale so the Frobenius norm (>= spectral norm) is <= max_norm."""
+    fro = torch.linalg.matrix_norm(M, ord="fro").clamp_min(1e-12)
+    scale = (max_norm / fro).clamp(max=1.0)
+    return M * scale.view(-1, *([1] * (M.dim() - 1))).to(M.dtype)
+
+
+def hermitian_from_raw(h_re: torch.Tensor, h_im: torch.Tensor) -> torch.Tensor:
+    M = torch.complex(h_re, h_im)
+    return 0.5 * (M + M.conj().transpose(-1, -2))
+
+
+def symmetric_from_raw(s_raw: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (s_raw + s_raw.transpose(-1, -2))
+
+
+def propagate(psi: torch.Tensor, H: torch.Tensor, S: torch.Tensor, dt: float = 1.0,
+              residual: str = "last"):
+    """
+    One generator for the heavy path:  dpsi/dt = A psi,  A = S - iH,  U = exp(A dt).
+
+    psi : [B, T, N] complex, UNNORMALISED dynamical state (normalise copies for readout).
+    H   : [B, N, N] Hermitian,  S : [B, N, N] real symmetric.
+    residual="last": regularise only the final pair (psi[T-2] -> psi[T-1]); the generator was
+                     built from velocities up to that pair, so no future information is used.
+    residual="all" : legacy behaviour (end-of-window generator applied to every earlier pair,
+                     which is NON-causal) - kept only as an ablation.
+
+    Returns U, L_pde, L_norm.
+      L_pde  : |psi_{t+1} - U psi_t|^2
+      L_norm : finite-step norm balance, relative growth
+               (|psi_{t+1}|^2 - |psi_t|^2)/|psi_t|^2  vs  psi_t^H (U^H U - I) psi_t / |psi_t|^2
+               (exact for the same U; for S=0, U is unitary and the target growth is 0).
+    """
+    A = S.to(torch.complex64) - 1j * H
+    U = torch.matrix_exp(A * dt)
+    if residual == "last":
+        p0, p1 = psi[:, -2:-1], psi[:, -1:]
+    elif residual == "all":
+        p0, p1 = psi[:, :-1], psi[:, 1:]
+    else:
+        raise ValueError(f"residual must be 'last' or 'all', got {residual!r}")
+    pred = torch.einsum("bij,btj->bti", U, p0)
+    L_pde = (p1 - pred).abs().pow(2).mean()
+    UhU = U.conj().transpose(-1, -2) @ U
+    n0 = p0.abs().pow(2).sum(-1).clamp_min(1e-8)
+    target = torch.einsum("bti,bij,btj->bt", p0.conj(), UhU, p0).real / n0 - 1.0
+    obs = p1.abs().pow(2).sum(-1) / n0 - 1.0
+    L_norm = (obs - target).pow(2).mean()
+    return U, L_pde, L_norm
