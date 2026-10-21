@@ -100,3 +100,8 @@ UTF-8 everywhere (AST test enforces it); suite runner reports failures + non-zer
 
 ## Review 8 (first Binance smoke run)
 Stale-checkpoint resume (tests polluting the real output dir via default-arg binding) fixed: call-time path resolution, run-fingerprint checkpoints (refuse mismatched config/data/epochs), smoke runs isolated in `experiments/_smoke/`, canonical Exp B copies only for real runs, tests verified not to touch real outputs. Added naive past-return lookup baseline to Exp C; suite summary scoped to attempted jobs. Data check: 30 days of Binance (Sep 2026), 0 outage seconds >300 s, stale-second share BTC 10.9% / ETH 24.5% / SOL 34.2%.
+
+## Review 10 (post-smoke)
+- Added `label_diagnostics.py` (stale/flat share, USD size of thresholds, return autocorrelation, naive-lookup split by stale windows) with tests on synthetic data.
+- Suite: `--gate_objective legacy|benefit` and `--seed` (separate job ids and output dirs; seed enters the checkpoint fingerprint).
+- Loop flux is reported across at least 5 seeds with intervals; no lead-lag claim. The smoke accuracies are 1 epoch and not citable.

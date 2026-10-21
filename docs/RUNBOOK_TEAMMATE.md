@@ -155,3 +155,14 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 ## Review-9 additions
 - `scripts/release_check.sh` now writes its log to `release_logs/` (git-ignored), so running it never dirties the working tree. If `docs/TEST_LOG_latest.txt` shows as modified from an earlier run, restore it: `git restore docs/TEST_LOG_latest.txt` (it is only a reference sample).
 - The suite only SKIPS a completed job when its recorded run signature (job + epochs/ticks + smoke-or-full) matches the current invocation. An older COMPLETED record without a matching signature (e.g. the invalid first smoke run) is re-run automatically. `--reset` forces a fresh start. The summary now says "N ran and succeeded; M skipped".
+
+## Review 10 — after the first valid Exp C smoke run
+
+The smoke run (1 epoch per stage, `experiments/_smoke/exp_C/`) validated the pipeline end to end. Its accuracies are NOT results.
+
+1. **Label diagnostics first (CPU, a few minutes):**
+   `python experiments/exp_C_multi_asset_binance/label_diagnostics.py`
+   Send `label_diagnostics.json`. The 5 s label thresholds are about ±1.3e-8 in log-return and the naive past-return rule scored 0.49 against a 0.37 majority, so check how much of the label is stale/flat-price persistence before reading any accuracy as signal.
+2. **Full Exp C run (about 4–5 h on the RTX 3060):** `python experiments/run_unattended_suite.py --only-binance` (no `--test`, no `--reset` unless you intend to restart). Send the log and `experiments/exp_C_multi_asset_binance/RESULTS.md`.
+3. **Benefit-vs-legacy gate study:** repeat with `--gate_objective benefit` (own job id and output dir under `experiments/runs/`).
+4. **Loop flux:** it changed sign between runs (+0.18, then −1.30). Run `--seed 0..4` and report the loop flux across at least 5 seeds with intervals. Make no lead-lag claim unless the interval excludes zero and holds on the held-out split.

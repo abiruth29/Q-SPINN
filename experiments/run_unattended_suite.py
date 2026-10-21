@@ -301,7 +301,12 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Reset state file and start fresh from job 1")
     parser.add_argument("--skip-binance", action="store_true", help="Skip Binance multi-asset and run only FI-2010 suite")
     parser.add_argument("--only-binance", action="store_true", help="Run only Binance multi-asset experiment")
+    parser.add_argument("--gate_objective", choices=["legacy", "benefit"], default="legacy",
+                        help="Gate training objective for Exp B and Exp C (non-default runs get their own job id / output dir)")
+    parser.add_argument("--seed", type=int, default=None, help="Exp C seed (default 0); run >=5 seeds before reporting loop flux")
     args = parser.parse_args()
+    gsuf = "" if args.gate_objective == "legacy" else f"_{args.gate_objective}"
+    gkw = {} if args.gate_objective == "legacy" else {"gate_objective": args.gate_objective}
 
     set_suite_files(args.test)
 
@@ -331,20 +336,24 @@ def main():
         seeds    = (0,)  if args.test else range(5)
         for k in horizons:
             for sd in seeds:
-                run_job(f"fi2010_k{k}_s{sd}", f"FI-2010 Setup 2, k={k}, seed {sd}",
-                        train_fi2010, horizon=k, seed=sd, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c,
-                        **({"out_dir": SMOKE_DIR / "exp_B"} if args.test else {}))
+                run_job(f"fi2010_k{k}_s{sd}{gsuf}", f"FI-2010 Setup 2, k={k}, seed {sd}, gate={args.gate_objective}",
+                        train_fi2010, horizon=k, seed=sd, epochs_a=ep_a, epochs_b=ep_b, epochs_c=ep_c, **gkw,
+                        **({"out_dir": SMOKE_DIR / f"exp_B{gsuf}"} if args.test else
+                           ({"out_dir": Path(__file__).resolve().parent / "runs" / f"exp_B{gsuf}_k{k}_s{sd}"} if gsuf else {})))
 
     if not args.skip_binance:
         # ── 5. Binance 3-Asset Basket (BTC, ETH, SOL with Magnetic Laplacian)
         from exp_C_multi_asset_binance.train import main as train_binance
+        csuf = gsuf + (f"_s{args.seed}" if args.seed is not None else "")
+        ckw = dict(gkw, **({"seed": args.seed} if args.seed is not None else {}))
         run_job(
-            "binance_3asset",
-            "Binance 3-Asset Hybrid with Magnetic Graph Laplacian (BTC, ETH, SOL)",
+            f"binance_3asset{csuf}",
+            f"Binance 3-Asset Hybrid with Magnetic Graph Laplacian (BTC, ETH, SOL), gate={args.gate_objective}",
             train_binance,
             epochs_a=binance_ep, epochs_b=binance_ep, epochs_c=binance_ep,
-            max_ticks=binance_ticks,
-            **({"out_dir": SMOKE_DIR / "exp_C"} if args.test else {})
+            max_ticks=binance_ticks, **ckw,
+            **({"out_dir": SMOKE_DIR / f"exp_C{csuf}"} if args.test else
+               ({"out_dir": Path(__file__).resolve().parent / "runs" / f"exp_C{csuf}"} if csuf else {}))
         )
 
     # ── 9. Final Master Report Generation ──────────────────────────────────

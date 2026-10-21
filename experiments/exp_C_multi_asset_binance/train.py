@@ -888,11 +888,12 @@ def train_lstm(Xtr, ytr, Xva, yva, device, epochs=15):
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
-def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy", out_dir=None):
+def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy", out_dir=None, seed=None):
     global OUT_DIR, CKPT_PATH
+    seed = SEED if seed is None else int(seed)
     if out_dir is not None:                       # smoke/trial runs must never touch the real output folder
         OUT_DIR = Path(out_dir); OUT_DIR.mkdir(parents=True, exist_ok=True); CKPT_PATH = OUT_DIR / "checkpoint.pt"
-    torch.manual_seed(SEED); np.random.seed(SEED)
+    torch.manual_seed(seed); np.random.seed(seed)
     log = ExperimentLogger(OUT_DIR / "train.log", experiment_name="Exp C — 3-Asset Binance Basket")
     device = get_device(verbose=True)
 
@@ -911,7 +912,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     set_run_fingerprint(fingerprint_of(exp="C", n_rows=int(len(feats)), n_feat=int(feats.shape[1]),
                                        head=float(np.round(np.asarray(feats[:2000], dtype=np.float64).sum(), 6)),
                                        tail=float(np.round(np.asarray(feats[-2000:], dtype=np.float64).sum(), 6)),
-                                       seq=SEQ_LEN, horizon=HORIZON, tf=TRAIN_FRAC, vf=VAL_FRAC, seed=SEED,
+                                       seq=SEQ_LEN, horizon=HORIZON, tf=TRAIN_FRAC, vf=VAL_FRAC, seed=seed,
                                        epochs=[epochs_a, epochs_b, epochs_c], max_ticks=max_ticks,
                                        batch=batch_size, gate=gate_objective))
     model = MultiAssetQSPINN(n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS).to(device)
