@@ -8,7 +8,7 @@ from pathlib import Path
 REFERENCE_DIR = Path("data/reference/fi2010")
 ZIP_PATH = REFERENCE_DIR / "BenchmarkDatasets.zip"
 
-def main():
+def main(setup2=False):
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
     
     if not ZIP_PATH.exists():
@@ -48,6 +48,10 @@ def main():
                 if "NoAuction/1.NoAuction_Zscore/" in member:
                     z.extract(member, temp_dir)
                     
+        if setup2:
+            _build_setup2(temp_dir)
+            return
+
         # 2. Parse the files
         print("Parsing folds and converting to Parquet...")
         base_path = temp_dir / "BenchmarkDatasets" / "NoAuction" / "1.NoAuction_Zscore"
@@ -105,5 +109,22 @@ def main():
         print("Cleaning up scratch files...")
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+def _build_setup2(temp_dir):
+    """Setup 2: Train CF7 once + Test CF7/8/9, with recovered stock/day segments (see experiments/fi2010_setup2.py)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "experiments"))
+    import fi2010_setup2 as f2
+    base = temp_dir / "BenchmarkDatasets" / "NoAuction" / "1.NoAuction_Zscore"
+    read = lambda p: pd.read_csv(p, sep=r'\s+', header=None).T.values
+    train = read(base / "NoAuction_Zscore_Training" / "Train_Dst_NoAuction_ZScore_CF_7.txt")
+    tests = {name: read(base / "NoAuction_Zscore_Testing" / f"Test_Dst_NoAuction_ZScore_CF_{cf}.txt")
+             for name, cf in f2.TEST_DAYS.items()}
+    frames = f2.build_setup2_frames(train, tests)
+    f2.save_setup2(frames, REFERENCE_DIR)
+    for name, r in f2.audit(frames).items():
+        flag = "OK " if r["confident"] else "LOW-CONFIDENCE"
+        print(f"  [{flag}] {name}: rows={r['rows']:,} segments={r['n_segments']} confidence={r['boundary_confidence']:.2f}")
+    print(f"Wrote {REFERENCE_DIR/'fi2010_setup2.parquet'} and segment_audit.json - INSPECT the audit before training.")
+
+
 if __name__ == "__main__":
-    main()
+    main(setup2="--setup2" in sys.argv)

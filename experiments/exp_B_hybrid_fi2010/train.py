@@ -449,6 +449,21 @@ def load_fi2010(log: ExperimentLogger, label_col=LABEL_COL):
     return Xtr, ytr, Xva, yva, Xte, yte
 
 
+def load_fi2010_setup2(log: ExperimentLogger, label_col=LABEL_COL):
+    """Task 07: Setup 2 (train days 1-7, test days 8-10) with stock/day segment ids."""
+    from fi2010_setup2 import load_setup2
+    path = ROOT / "data" / "reference" / "fi2010" / "fi2010_setup2.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Build it first:  python procure_fi2010.py --setup2  "
+            "(then inspect segment_audit.json), or pass --legacy_split to reproduce the old protocol.")
+    log.section(f"Loading FI-2010 Setup 2 ({label_col})")
+    d = load_setup2(path, label_col)
+    for k in ("train", "val", "test"):
+        log.metric(f"{k} rows", len(d[k]["X"]))
+    return d
+
+
 def build_regime_mask(feats: np.ndarray) -> np.ndarray:
     """2σ realized-volatility proxy on the FI-2010 mid-price series."""
     import pandas as pd
@@ -909,10 +924,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
     parser.add_argument("--out_dir", type=str, default="", help="Custom output directory")
     parser.add_argument("--run_name", type=str, default="", help="Run tag for logs")
+    parser.add_argument("--legacy_split", action="store_true",
+                        help="Old concatenated-fold protocol (NOT Setup 2); results must be labelled legacy")
     return parser.parse_args()
 
 
-def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name=""):
+def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name="", legacy_split=False):
     if horizon is None and __name__ == "__main__" and len(sys.argv) > 1:
         args = parse_args()
         horizon = args.horizon
@@ -923,6 +940,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         batch_size = args.batch_size
         out_dir = Path(args.out_dir) if args.out_dir else OUT_DIR
         run_name = args.run_name
+        legacy_split = args.legacy_split
     else:
         horizon = 10 if horizon is None else horizon
         seed = 0 if seed is None else seed
@@ -941,22 +959,33 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
                            experiment_name=f"Exp B — FI-2010 (k={horizon}, seed={seed})")
     device = get_device(verbose=True)
 
-    # Load data for the requested horizon
-    Xtr_np, ytr_np, Xva_np, yva_np, Xte_np, yte_np = load_fi2010(log, label_col=label_col)
+    # Load data for the requested horizon (Task 07: Setup 2 with provenance by default)
+    if legacy_split:
+        log.warn("LEGACY concatenated-fold split - results are NOT Setup 2 and must be labelled legacy.")
+        Xtr_np, ytr_np, Xva_np, yva_np, Xte_np, yte_np = load_fi2010(log, label_col=label_col)
+        segs = dict(train=None, val=None, test=None)
+    else:
+        d = load_fi2010_setup2(log, label_col=label_col)
+        Xtr_np, ytr_np = d["train"]["X"], d["train"]["y"]
+        Xva_np, yva_np = d["val"]["X"],   d["val"]["y"]
+        Xte_np, yte_np = d["test"]["X"],  d["test"]["y"]
+        segs = {k: d[k]["seg"] for k in ("train", "val", "test")}
 
-    # Build regime masks
     log.section("Building 2σ regime masks")
-    rtr_np = build_regime_mask(Xtr_np)
-    rva_np = build_regime_mask(Xva_np)
-    rte_np = build_regime_mask(Xte_np)
+    if legacy_split:
+        rtr_np, rva_np, rte_np = (build_regime_mask(a) for a in (Xtr_np, Xva_np, Xte_np))
+    else:   # per-segment so volatility statistics never leak across stock/day joins
+        from fi2010_setup2 import segmented_regime_mask
+        rtr_np, rva_np, rte_np = (segmented_regime_mask(Xs, segs[k], REGIME_WINDOW, REGIME_SIGMA)
+                                  for Xs, k in ((Xtr_np, "train"), (Xva_np, "val"), (Xte_np, "test")))
     log.metric("Train regime %", rtr_np.mean() * 100, unit="%")
     log.metric("Val regime %",   rva_np.mean() * 100, unit="%")
     log.metric("Test regime %",  rte_np.mean() * 100, unit="%")
 
-    log.section("Building sequence windows (SEQ_LEN=20)")
-    Xtr, ytr, rtr, dt_tr = make_windows_from_array(Xtr_np, ytr_np, rtr_np)
-    Xva, yva, rva, dt_va = make_windows_from_array(Xva_np, yva_np, rva_np)
-    Xte, yte, rte, dt_te = make_windows_from_array(Xte_np, yte_np, rte_np)
+    log.section("Building sequence windows (SEQ_LEN=20, per stock-day segment)")
+    Xtr, ytr, rtr, dt_tr = make_windows_from_array(Xtr_np, ytr_np, rtr_np, segs["train"], horizon)
+    Xva, yva, rva, dt_va = make_windows_from_array(Xva_np, yva_np, rva_np, segs["val"],   horizon)
+    Xte, yte, rte, dt_te = make_windows_from_array(Xte_np, yte_np, rte_np, segs["test"],  horizon)
 
     mode_val = torch.mode(yte)[0].item()
     majority = (yte == mode_val).float().mean().item()
@@ -965,6 +994,8 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     log.metric("Val windows",   len(Xva))
     log.metric("Test windows",  len(Xte))
     log.metric("Majority baseline", majority)
+    majority_f1 = macro_f1(torch.full_like(yte, mode_val), yte)   # Task 07: majority-class macro-F1
+    log.metric("Majority-class macro-F1", majority_f1)
 
     try:
         model = QSPINN().to(device)
@@ -1021,7 +1052,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
              "n/a" if omega != omega else f"{omega:.4f}",
              "n/a" if crash != crash else f"{crash*100:.1f}%")
             for name, acc, f1, gate, herm, omega, crash in ablation_rows
-        ] + [("Majority baseline", f"{majority:.3f}", "—", "—", "—", "—", "—")],
+        ] + [("Majority baseline", f"{majority:.3f}", f"{majority_f1:.3f}", "—", "—", "—", "—")],
         title=f"Ablation Results (k={horizon}, seed={seed})",
     )
 
