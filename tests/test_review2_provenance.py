@@ -43,13 +43,11 @@ def test_contract_requires_protocol():
     assert not contracts_match(old, live)[0]
 
 
-def test_infinite_aggregate_norm_skips_without_touching_optimizer_state():
+def test_overflowing_aggregate_norm_is_clipped_not_discarded():
+    """Review 3: finite entries whose naive norm overflows must be clipped (and the step taken), not zeroed/skipped."""
     wd = torch.nn.Parameter(torch.zeros(3, dtype=torch.float64))
-    opt = torch.optim.SGD([wd], lr=.1, momentum=.9)
-    loss = (wd * 1e200).sum()                       # every grad entry 1e200 (finite) ...
-    g = StepGuard()
-    assert torch.isfinite(torch.autograd.grad(loss, wd, retain_graph=True)[0]).all()
-    ok = g.step(loss, [wd], opt)                    # ... but the aggregate norm overflows to inf
-    assert ok is False and g.n_skipped == 1
-    assert torch.equal(wd.detach(), torch.zeros(3, dtype=torch.float64))
-    assert len(opt.state) == 0                      # no momentum buffer was created
+    opt = torch.optim.SGD([wd], lr=1.0)
+    loss = (wd * 1e200).sum()
+    g = StepGuard(max_grad_norm=1.0)
+    assert g.step(loss, [wd], opt) is True and g.n_skipped == 0
+    assert torch.allclose(wd.detach(), torch.full((3,), -1 / 3 ** .5, dtype=torch.float64), atol=1e-6)

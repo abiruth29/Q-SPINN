@@ -49,6 +49,22 @@ def align_on_grid(frames, max_gap: int = 300):
     return out, grid
 
 
+def assert_no_long_outage(frames, grid):
+    """
+    Fail closed: raise if ANY asset has a flagged long outage anywhere on the grid.  A percentage threshold
+    admits short-but-real holes whose stale flat prices and resumption jump would enter features, windows and
+    labels.  (Split-and-continue would additionally need rolling-feature, encoder-delta and window/label resets
+    at the seam; that is deliberately not implemented - split the raw series before building instead.)
+    """
+    flag = np.max(np.stack([g["long_gap"].values for g in frames]), axis=0) > 0
+    if flag.any():
+        idx = np.flatnonzero(flag)
+        runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
+        spans = [(int(grid[r[0]]), int(grid[r[-1]])) for r in runs[:5]]
+        raise RuntimeError(f"{len(runs)} long data outage(s) on the aligned grid (first: unix seconds {spans}). "
+                           "Split the series at these gaps before building the dataset.")
+
+
 def gap_fraction(frames) -> float:
     """Share of grid seconds in which ANY asset is in a long outage."""
     return float(np.mean(np.max(np.stack([g["long_gap"].values for g in frames]), axis=0)))

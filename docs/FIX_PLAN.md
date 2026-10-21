@@ -73,3 +73,10 @@ section of the project report (Chapter 7) that describes the problem.
 | 17 | Exp A migration; equal baseline budgets | Exp A excluded (guarded); baselines get equal epoch budget/loop/early stopping, no tuning for any model |
 | 18 | Smoothing relabel | done |
 | 19 | Covariance disabled until observation model exists | unchanged (off) |
+
+## Review 3 (v3.1.1 recheck) — implemented
+1. **StepGuard**: global norm computed overflow-safe (float64, max-scaled); clip applied with that norm. Finite-entry gradients whose naive norm overflows are now clipped, not zeroed or discarded. Non-finite entries still skip with no state change.
+2. **Outages are fail-closed**: `assert_no_long_outage` raises on ANY flagged outage (> `max_gap` s) before dataset build. Split raw series at gaps instead of building across them.
+3. **Event warning evaluation**: one alarm policy (episode start + renewal every tau rows) drives detection, lead and false alarms; at-risk clock = `eligible` rows; warm-up and segment-end events/alarms are CENSORED (reported as `events_censored`, `alarms_censored`), never counted as misses/false alarms; exposure = eligible rows. Rates are per `rows_per_unit_time`, not per hour.
+4. External (teammate): verified FI-2010 `segment_lengths.json` with day/stock order and source-file identity; actual split = train days 1-6 / val day 7 / test days 8-10.
+5. External (teammate): report actual epochs/updates executed for baselines vs hybrid; paired segment-aware differences vs baselines.

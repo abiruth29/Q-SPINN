@@ -74,12 +74,26 @@ class StepGuard:
         grads = [p.grad for p in params if p.grad is not None]
         if any(not torch.isfinite(g).all() for g in grads):
             return self._skip(opt)
-        # aggregate norm can overflow to inf even when every entry is finite -> reject BEFORE the step
-        gn = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.double()) for g in grads])) if grads \
-            else torch.zeros(())
+        # Safe global norm: per-tensor magnitudes (complex-safe) in float64, so neither the entries nor their
+        # aggregate can overflow here.  The clip is then applied with THIS norm - torch's clip_grad_norm_ recomputes
+        # the norm in the gradient dtype and zeroes float32 gradients whose squares overflow (review 3, item 1).
+        if grads:
+            mx = torch.stack([g.detach().abs().amax().double() for g in grads]).amax()
+            if float(mx) == 0.0:
+                gn = torch.zeros((), dtype=torch.float64)
+            else:   # scale by the max magnitude first so even float64 squares cannot overflow
+                gn = mx * torch.linalg.vector_norm(torch.stack(
+                    [torch.linalg.vector_norm(g.detach().abs().double() / mx) for g in grads]))
+        else:
+            gn = torch.zeros((), dtype=torch.float64)
         if not torch.isfinite(gn):
             return self._skip(opt)
-        torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+        coef = min(1.0, self.max_grad_norm / (float(gn) + 1e-6))
+        if coef < 1.0:
+            for g in grads:
+                g.mul_(coef)
+        if not all(bool(torch.isfinite(g).all()) for g in grads):      # scaled grads must still be finite
+            return self._skip(opt)
         self.last_grad_norm = float(gn)
         opt.step()
         self.n_steps += 1

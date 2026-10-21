@@ -111,3 +111,9 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 | Binance common 1 s clock, train-only labels | `binance_align.py` | `test_phase1_binance_align.py` |
 | budgeted routing, conditional inference, early warning | `routing.py` + two drivers | `test_phase2_*.py` |
 | DeepLOB baseline, intervals, claims cleanup, live contract | `baselines.py`, `stats.py`, README, `live_contract.py` | `test_phase3_*.py` |
+
+## Review-3 additions
+- A data outage is a HARD STOP (RuntimeError from `assert_no_long_outage`): split the raw Binance series at the gap and rebuild; do not work around it.
+- FI-2010: `segment_lengths.json` must be verified against the source files; record file identity (names/hashes), day order, stock order, and confirm the split is train days 1-6, val day 7, test days 8-10.
+- Early-warning results now include `events_total/evaluable/censored`, `alarms`, `false_alarms`, `alarms_censored`, `exposure_rows`, and the policy (tau, refractory, renew_every). Report them as-is.
+- Report the actual epochs/updates executed for baselines and the hybrid, and paired segment-aware differences vs baselines.

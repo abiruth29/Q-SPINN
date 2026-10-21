@@ -248,45 +248,84 @@ def realised_onsets(signal: np.ndarray, thr: float, refractory: int, seg: Option
     return np.array(onsets, dtype=np.int64)
 
 
-def event_alert_metrics(alert: np.ndarray, onsets: np.ndarray, tau: int, seg: Optional[np.ndarray] = None,
-                        rows_per_unit_time: Optional[float] = None, refractory: Optional[int] = None):
-    """
-    Event-based warning evaluation on ONE row clock (concatenated rows + segment ids).
+def _seg_bounds(seg: np.ndarray):
+    """Per-row first and last row index of the (contiguous) segment each row belongs to."""
+    n = len(seg)
+    change = np.flatnonzero(seg[1:] != seg[:-1]) + 1
+    starts = np.r_[0, change]; ends = np.r_[change - 1, n - 1]
+    lens = ends - starts + 1
+    return np.repeat(starts, lens), np.repeat(ends, lens)
 
-    * alert[t] True = an alert is raised at row t (e.g. calibrated prob >= validation threshold)
-    * an event at row r is DETECTED if some alert lies in [r - tau, r) inside the same segment;
-      lead = r - (earliest such alert row), in rows (convert with your clock afterwards)
-    * alert EPISODES: contiguous alert runs, merged if separated by <= `refractory` (default tau)
-      rows, never merged across segments.  A FALSE ALERT is an episode with no event in
-      (episode start, start + tau] inside its segment.
-    * false_alerts_per_unit_time uses `rows_per_unit_time` (e.g. rows per hour) when given.
+
+def alarms_from_alerts(alert: np.ndarray, seg: np.ndarray, refractory: int, renew_every: Optional[int]):
+    """
+    ONE alarm policy used for detection, lead time AND false alerts.
+    An *episode* is a run of alerted rows inside one segment (gaps <= refractory rows merge).  An alarm is
+    raised at the first row of each episode and, if `renew_every` is not None, renewed at the first alerted
+    row at least `renew_every` rows after the previous alarm while the episode continues.  `renew_every=None`
+    means starts only.
+    """
+    alarms = []
+    prev, last_alarm = None, None
+    for t in np.flatnonzero(alert):
+        new_ep = prev is None or seg[t] != seg[prev] or t - prev > refractory + 1
+        if new_ep or (renew_every is not None and t - last_alarm >= renew_every):
+            alarms.append(int(t)); last_alarm = t
+        prev = t
+    return np.array(alarms, dtype=np.int64)
+
+
+def event_alert_metrics(alert: np.ndarray, onsets: np.ndarray, tau: int, seg: Optional[np.ndarray] = None,
+                        eligible: Optional[np.ndarray] = None, rows_per_unit_time: Optional[float] = None,
+                        refractory: Optional[int] = None, renew_every="tau"):
+    """
+    Event-based warning evaluation on ONE row clock (concatenated rows + segment ids), one matching policy.
+
+    alert     bool per row, True where the model raised/maintained an alert (must be False on rows without a
+              prediction).
+    eligible  bool per row: rows where the model COULD have predicted (the at-risk clock).  None = all rows.
+    ALARMS    from `alarms_from_alerts` (episode starts, renewed every `renew_every` rows; "tau" -> tau,
+              None -> starts only).
+    * An event at row r is EVALUABLE only if the whole lead window [r-tau, r) lies in r's segment and every row
+      in it is eligible; otherwise it is CENSORED (warm-up at segment start, scoring cut-off at segment end).
+    * An evaluable event is DETECTED if an alarm lies in [r-tau, r); lead = r - earliest such alarm (rows).
+    * An alarm is FALSE if its follow window (a, a+tau] lies inside its segment and contains no realised
+      onset; if the window is cut by the segment end the alarm is CENSORED (not counted either way).
+    * Exposure for rates = number of eligible rows (not all rows).  Rates are per `rows_per_unit_time`
+      (e.g. 1000 rows) - they are NOT per-hour rates unless you convert with a real clock.
     """
     alert = np.asarray(alert, dtype=bool); n = len(alert)
     seg = np.zeros(n, dtype=np.int64) if seg is None else np.asarray(seg)
+    elig = np.ones(n, dtype=bool) if eligible is None else np.asarray(eligible, dtype=bool)
+    alert = alert & elig
     onsets = np.asarray(onsets, dtype=np.int64)
     refractory = tau if refractory is None else refractory
-    leads = []
+    renew = tau if renew_every == "tau" else renew_every
+    sstart, send = _seg_bounds(seg)
+    alarms = alarms_from_alerts(alert, seg, refractory, renew)
+
+    leads, evaluable, censored_events = [], 0, 0
     for r in onsets:
-        lo = max(0, r - tau)
-        w = np.flatnonzero(alert[lo:r] & (seg[lo:r] == seg[r]))
-        if len(w): leads.append(int(r - (lo + w[0])))
-    # episodes
-    starts = []
-    idx = np.flatnonzero(alert)
-    prev = None
-    for t in idx:
-        if prev is None or seg[t] != seg[prev] or t - prev > refractory + 1:
-            starts.append(int(t))
-        prev = t
-    false_alerts = 0
-    for st in starts:
-        hi = min(n, st + tau + 1)
-        hit = np.any((onsets > st) & (onsets < hi) & (seg[np.minimum(onsets, n - 1)] == seg[st]))
-        false_alerts += int(not hit)
-    out = dict(events=int(len(onsets)), detected=len(leads),
-               detection_rate=(len(leads) / len(onsets)) if len(onsets) else float("nan"),
+        lo = r - tau
+        if lo < sstart[r] or not elig[lo:r].all():
+            censored_events += 1; continue
+        evaluable += 1
+        hit = alarms[(alarms >= lo) & (alarms < r)]
+        if len(hit): leads.append(int(r - hit.min()))
+    false_alarms = censored_alarms = 0
+    for a in alarms:
+        if a + tau > send[a]:
+            censored_alarms += 1; continue
+        if not np.any((onsets > a) & (onsets <= a + tau)):
+            false_alarms += 1
+    exposure = int(elig.sum())
+    out = dict(events_total=int(len(onsets)), events_evaluable=evaluable, events_censored=censored_events,
+               detected=len(leads),
+               detection_rate=(len(leads) / evaluable) if evaluable else float("nan"),
                mean_lead_rows=float(np.mean(leads)) if leads else float("nan"),
-               alert_episodes=len(starts), false_alerts=false_alerts)
+               alarms=int(len(alarms)), false_alarms=false_alarms, alarms_censored=censored_alarms,
+               exposure_rows=exposure,
+               policy=dict(tau=tau, refractory=refractory, renew_every=renew))
     if rows_per_unit_time:
-        out["false_alerts_per_unit_time"] = false_alerts / (n / rows_per_unit_time)
+        out["false_alarms_per_unit_time"] = false_alarms / (exposure / rows_per_unit_time) if exposure else float("nan")
     return out

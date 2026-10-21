@@ -490,7 +490,7 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
 
 
 def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS):
-    from binance_align import align_on_grid, frame_to_features, forward_labels, gap_fraction
+    from binance_align import align_on_grid, frame_to_features, forward_labels, gap_fraction, assert_no_long_outage
     log.section("Loading & Engineering 3-Asset Binance Trade Streams (common 1 s clock)")
     syms = ["symbol=BTCUSDT", "symbol=ETHUSDT", "symbol=SOLUSDT"]
     raw = []
@@ -504,8 +504,7 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
     aligned, grid = align_on_grid(raw)
     gf = gap_fraction(aligned)
     log.metric("Seconds inside a >300 s outage of any asset", gf * 100, unit="%")
-    if gf > 0.01:     # fail closed: outages would be silently forward-filled for minutes/hours
-        raise RuntimeError(f"{gf:.1%} of the grid is inside a long data outage; split the series at the gaps first")
+    assert_no_long_outage(aligned, grid)     # fail closed on ANY flagged outage (not a dataset-wide percentage)
     all_feats = [frame_to_features(g) for g in aligned]
     for s, g in zip(syms, aligned):
         log.metric(f"{s.split('=')[1]} stale-second %", float(g["stale"].mean() * 100), unit="%")
@@ -542,9 +541,9 @@ def make_windows_binance(feats, labels, regime):
     sd = train_feats.std(0, keepdims=True) + 1e-8
     x_norm = (feats - mu) / sd
 
-    Xt = torch.from_numpy(x_norm)
-    yt = torch.from_numpy(labels)
-    rt = torch.from_numpy(regime)
+    Xt = torch.from_numpy(np.array(x_norm, copy=True))
+    yt = torch.from_numpy(np.array(labels, copy=True))
+    rt = torch.from_numpy(np.array(regime, copy=True))
     dt = torch.ones(len(feats), dtype=torch.float32) * 1.0 # 1s regular bins
 
     Xw = Xt.unfold(0, SEQ_LEN, 1).transpose(1, 2)

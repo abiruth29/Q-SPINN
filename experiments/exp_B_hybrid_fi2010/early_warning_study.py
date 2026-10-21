@@ -89,11 +89,16 @@ def main():
         pv, pt = R.platt_apply(P["val"][key], params), R.platt_apply(P["test"][key], params)
         at = best_f1_threshold(pv, P["val"]["y"])
         row_alert = np.zeros(len(d["test"]["X"]), dtype=bool); row_alert[P["test"]["last"]] = pt >= at
+        eligible = np.zeros(len(d["test"]["X"]), dtype=bool); eligible[P["test"]["last"]] = True   # at-risk clock
         res[name] = dict(R.alert_metrics(pt, P["test"]["y"]), alert_threshold=at,
                          test_label_prevalence=float(P["test"]["y"].mean()),
-                         **R.event_alert_metrics(row_alert, onsets, a.tau, seg_te, rows_per_unit_time=1000.0))
+                         **R.event_alert_metrics(row_alert, onsets, a.tau, seg_te, eligible=eligible,
+                                                 rows_per_unit_time=1000.0))
     res["event_definition"] = dict(signal="|delta mid| per row (0 across joins)", threshold_train_q99=ev_thr,
-                                   refractory_rows=a.tau, false_alerts_per_unit_time="per 1000 rows")
+                                   refractory_rows=a.tau, alarm_policy="episode start + renewal every tau rows while alert persists",
+                                   at_risk_clock="rows with a valid input window and a scored future window; events/alarms "
+                                                 "whose lead/follow window leaves that set are censored, not counted",
+                                   false_alarms_per_unit_time="per 1000 eligible rows (not per hour)")
     out = HERE / f"early_warning_k{a.horizon}_s{a.seed}.json"
     out.write_text(json.dumps(res, indent=2)); log.info(f"wrote {out}")
 

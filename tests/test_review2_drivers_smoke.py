@@ -43,4 +43,4 @@ def test_routing_and_early_warning_drivers_run(env, monkeypatch):
     assert lat["dense_heavy_s"] > 0 and lat["cheap_only_s"] > 0 and set(lat["hybrid_at_fraction_s"]) == {"0.0", "0.1", "0.25", "0.5", "1.0"}
     assert lat["hybrid_at_fraction_s"]["0.0"] < lat["hybrid_at_fraction_s"]["1.0"]      # skipping the heavy expert is cheaper
     e = json.loads((tmp / "early_warning_k10_s0.json").read_text())
-    assert {"omega", "rolling_vol", "event_definition"} <= set(e) and "false_alerts" in e["omega"]
+    assert {"omega", "rolling_vol", "event_definition"} <= set(e) and "false_alarms" in e["omega"]
