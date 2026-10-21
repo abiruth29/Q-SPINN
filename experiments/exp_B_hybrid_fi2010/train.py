@@ -1001,7 +1001,8 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
 
     try:
         model = QSPINN().to(device)
-        model.encoder.fit(Xtr_np)   # Task 04: train-only thresholds, same encoder for val/test
+        vp = None if segs["train"] is None else (segs["train"][1:] == segs["train"][:-1])   # no stock/day-join deltas
+        model.encoder.fit(Xtr_np, valid_pair=vp)   # train-only thresholds, same encoder for val/test
         ckpt = load_checkpoint(ckpt_path, log)
         current_stage = ckpt["stage"] if ckpt else None
         

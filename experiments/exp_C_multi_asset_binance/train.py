@@ -449,7 +449,7 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
 
 
 def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS):
-    from binance_align import align_on_grid, frame_to_features, forward_labels
+    from binance_align import align_on_grid, frame_to_features, forward_labels, gap_fraction
     log.section("Loading & Engineering 3-Asset Binance Trade Streams (common 1 s clock)")
     syms = ["symbol=BTCUSDT", "symbol=ETHUSDT", "symbol=SOLUSDT"]
     raw = []
@@ -461,6 +461,10 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
         log.info(f"  {name}: {len(f):,} non-empty seconds  [{f.index.min()} .. {f.index.max()}]")
 
     aligned, grid = align_on_grid(raw)
+    gf = gap_fraction(aligned)
+    log.metric("Seconds inside a >300 s outage of any asset", gf * 100, unit="%")
+    if gf > 0.01:     # fail closed: outages would be silently forward-filled for minutes/hours
+        raise RuntimeError(f"{gf:.1%} of the grid is inside a long data outage; split the series at the gaps first")
     all_feats = [frame_to_features(g) for g in aligned]
     for s, g in zip(syms, aligned):
         log.metric(f"{s.split('=')[1]} stale-second %", float(g["stale"].mean() * 100), unit="%")

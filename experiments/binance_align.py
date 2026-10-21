@@ -16,11 +16,15 @@ FLOW_COLS = ["signed_volume", "buy_vol", "sell_vol", "trade_count", "total_pq", 
 PRICE_COLS = ["mid_sum", "mid_count"]
 
 
-def align_on_grid(frames):
+def align_on_grid(frames, max_gap: int = 300):
     """
     frames: list of DataFrames indexed by integer unix-second with the raw per-second aggregate
     columns.  Returns (list of frames on the shared grid, grid index).  Grid = [max(first), min(last)]
-    at 1 s.  Empty seconds get zero flow and a carried-forward mid price (flag `stale`=1).
+    at 1 s.  Empty seconds get zero flow and the LAST OBSERVED price (strictly causal - values are
+    seeded from the asset's own pre-grid history; there is no backward fill).  Extra columns:
+      stale     1 if no trade in that second
+      age       seconds since the last real trade
+      long_gap  1 if age > max_gap (data outage; callers must exclude/handle, see `gap_fraction`)
     """
     lo = max(int(f.index.min()) for f in frames)
     hi = min(int(f.index.max()) for f in frames)
@@ -29,13 +33,25 @@ def align_on_grid(frames):
     grid = pd.RangeIndex(lo, hi + 1, name="second")
     out = []
     for f in frames:
+        f = f.sort_index()
+        mid_obs = (f["mid_sum"] / f["mid_count"].where(f["mid_count"] > 0))
+        obs_t = pd.Series(f.index.values.astype(np.int64), index=f.index).where(mid_obs.notna())
+        union = f.index.union(grid)
+        mid = mid_obs.reindex(union).ffill().reindex(grid)        # last price at-or-before t (pre-grid seed included)
+        last_t = obs_t.reindex(union).ffill().reindex(grid)
         g = f.reindex(grid)
         stale = g["mid_count"].isna().astype(np.float32)
         g[FLOW_COLS] = g[FLOW_COLS].fillna(0.0)
-        mid = (g["mid_sum"] / g["mid_count"].where(g["mid_count"] > 0)).ffill().bfill()
-        g = g.assign(mid_price=mid, stale=stale)
-        out.append(g)
+        if mid.isna().any():                                      # cannot happen when lo = max(first); fail closed
+            raise ValueError("price unavailable at grid start without look-ahead")
+        age = (grid.values.astype(np.int64) - last_t.values).astype(np.float32)
+        out.append(g.assign(mid_price=mid, stale=stale, age=age, long_gap=(age > max_gap).astype(np.float32)))
     return out, grid
+
+
+def gap_fraction(frames) -> float:
+    """Share of grid seconds in which ANY asset is in a long outage."""
+    return float(np.mean(np.max(np.stack([g["long_gap"].values for g in frames]), axis=0)))
 
 
 def frame_to_features(g: pd.DataFrame) -> np.ndarray:
@@ -62,7 +78,9 @@ def forward_labels(returns: np.ndarray, horizon: int, train_end: int, q=(33.33, 
     fut = np.full(n, np.nan)
     idx = np.arange(n - horizon)
     fut[idx] = (csum[idx + 1 + horizon] - csum[idx + 1]) / horizon
-    valid_train = fut[:train_end][~np.isnan(fut[:train_end])]
+    # only summaries whose whole support (t, t+horizon] lies inside the training span: t+horizon < train_end
+    valid_train = fut[: max(train_end - horizon, 0)]
+    valid_train = valid_train[~np.isnan(valid_train)]
     lo, hi = np.percentile(valid_train, q[0]), np.percentile(valid_train, q[1])
     lab = np.ones(n, dtype=np.int64)
     lab[fut > hi] = 2

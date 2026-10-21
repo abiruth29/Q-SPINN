@@ -167,7 +167,8 @@ def forward_instability_labels(returns: np.ndarray, tau: int, train_end: int, q:
     ending at t.  Last `tau` rows are -1 (undefined).
     """
     fv = future_vol(returns, tau)
-    thr = np.quantile(fv[:train_end][~np.isnan(fv[:train_end])], q)
+    ft = fv[: max(train_end - tau, 0)]                       # support (t, t+tau] must end inside training
+    thr = np.quantile(ft[~np.isnan(ft)], q)
     lab = (fv > thr).astype(np.int64); lab[np.isnan(fv)] = -1
     return lab, float(thr)
 
