@@ -76,13 +76,10 @@ def test_forward_labels_strictly_future_and_train_threshold():
 def test_alert_metrics_perfect_and_random():
     y = np.zeros(1000, dtype=int); y[300:320] = 1; y[700:710] = 1
     perfect = y.astype(float) * .9 + .05
-    m = R.alert_metrics(perfect, y, 0.5, tau=10)
-    assert m["auroc"] > 0.99 and m["auprc"] > 0.99 and m["brier"] < 0.01 and m["events"] == 2
+    m = R.alert_metrics(perfect, y)
+    assert m["auroc"] > 0.99 and m["auprc"] > 0.99 and m["brier"] < 0.01
     noise = rng.random(1000)
-    assert abs(R.alert_metrics(noise, y, 0.5, 10)["auroc"] - 0.5) < 0.15
-    # early alert gives positive lead time
-    early = np.zeros(1000); early[290:320] = 1; early[690:710] = 1
-    assert R.alert_metrics(early, y, 0.5, 20)["mean_lead"] >= 5
+    assert abs(R.alert_metrics(noise, y)["auroc"] - 0.5) < 0.15
 
 
 def test_platt_calibration_improves_brier():

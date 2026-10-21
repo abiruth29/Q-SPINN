@@ -6,8 +6,9 @@ Exp B — forward early-warning study (task 10).  RUN BY THE TEAMMATE after trai
 Label: future realised-vol (t, t+tau] above the TRAIN 95th percentile, computed inside each stock-day
 segment (never across joins).  Scores compared on the untouched test days:
     omega (numerical abscissa of S)  vs  backward rolling-vol  vs  cheap-expert (SNN) confidence-free baseline
-Alert probability is Platt-calibrated on VALIDATION; alert threshold also chosen on validation
-(max F1).  Reports AUROC / AUPRC / Brier / false-alarm rate / lead time.  omega stays a latent-flow
+Alert probability is Platt-calibrated on VALIDATION; alert threshold also chosen on validation (max F1).
+Score metrics (AUROC/AUPRC/Brier) use the future-window label; lead time and false alerts use REALISED shock onsets
+(|delta mid| above the train 99th pct) on the row clock, segment-safe (`routing.event_alert_metrics`).  omega stays a latent-flow
 diagnostic unless it beats the rolling-vol baseline here.
 """
 import argparse, json, sys
@@ -65,26 +66,36 @@ def main():
     model = T.QSPINN().to(device); model.encoder.fit(d["train"]["X"])
     T.load_state_compat(model, torch.load(a.weights, map_location=device)); model.eval()
 
-    res = {}
-    P = {}
+    def abs_ret(X, seg):                     # observed per-row shock magnitude; zero across stock/day joins
+        mid = (X[:, 0] + X[:, 2]) / 2.0
+        r = np.r_[0.0, np.abs(np.diff(mid))]
+        r[np.r_[True, seg[1:] != seg[:-1]]] = 0.0
+        return r
+    ev_thr = float(np.quantile(abs_ret(d["train"]["X"], d["train"]["seg"]), 0.99))   # TRAIN only
+
+    res, P = {}, {}
     for k in ("val", "test"):
         st = window_starts(len(d[k]["X"]), T.SEQ_LEN, d[k]["seg"], a.tau)
         last = st + T.SEQ_LEN - 1
         y = (fv[k][last] > thr).astype(np.int64)
         Xw = torch.from_numpy(d[k]["X"]).unfold(0, T.SEQ_LEN, 1).transpose(1, 2)[st]
         mid = (d[k]["X"][:, 0] + d[k]["X"][:, 2]) / 2.0
-        # rolling vol computed per segment (causal), then sampled at the window end
-        rv = np.zeros(len(mid))
-        for s in np.unique(d[k]["seg"]):
-            ii = np.flatnonzero(d[k]["seg"] == s); rv[ii] = R.rolling_vol_score(mid[ii])
-        P[k] = dict(y=y, omega=omega_scores(model, Xw, device), rv=rv[last])
-    for name in ("omega", "rolling_vol"):
-        key = "omega" if name == "omega" else "rv"
+        rv = np.zeros(len(mid))             # causal rolling vol per segment, sampled at the window end
+        for s_ in np.unique(d[k]["seg"]):
+            ii = np.flatnonzero(d[k]["seg"] == s_); rv[ii] = R.rolling_vol_score(mid[ii])
+        P[k] = dict(y=y, last=last, omega=omega_scores(model, Xw, device), rv=rv[last])
+    seg_te = d["test"]["seg"]
+    onsets = R.realised_onsets(abs_ret(d["test"]["X"], seg_te), ev_thr, refractory=a.tau, seg=seg_te)
+    for name, key in (("omega", "omega"), ("rolling_vol", "rv")):
         params = R.platt_fit(P["val"][key], P["val"]["y"].astype(float))
         pv, pt = R.platt_apply(P["val"][key], params), R.platt_apply(P["test"][key], params)
         at = best_f1_threshold(pv, P["val"]["y"])
-        res[name] = R.alert_metrics(pt, P["test"]["y"], at, a.tau)
-        res[name].update(alert_threshold=at, test_prevalence=float(P["test"]["y"].mean()))
+        row_alert = np.zeros(len(d["test"]["X"]), dtype=bool); row_alert[P["test"]["last"]] = pt >= at
+        res[name] = dict(R.alert_metrics(pt, P["test"]["y"]), alert_threshold=at,
+                         test_label_prevalence=float(P["test"]["y"].mean()),
+                         **R.event_alert_metrics(row_alert, onsets, a.tau, seg_te, rows_per_unit_time=1000.0))
+    res["event_definition"] = dict(signal="|delta mid| per row (0 across joins)", threshold_train_q99=ev_thr,
+                                   refractory_rows=a.tau, false_alerts_per_unit_time="per 1000 rows")
     out = HERE / f"early_warning_k{a.horizon}_s{a.seed}.json"
     out.write_text(json.dumps(res, indent=2)); log.info(f"wrote {out}")
 

@@ -212,18 +212,72 @@ def auprc(scores: np.ndarray, y: np.ndarray) -> float:
     return float(np.sum((rec - rec_prev) * prec))
 
 
-def alert_metrics(prob: np.ndarray, y: np.ndarray, alert_thr: float, tau: int):
-    """AUROC, AUPRC, Brier, false-alarm rate and mean lead time (steps from first alert in an episode to onset)."""
-    alert = prob >= alert_thr
-    brier = float(np.mean((prob - y) ** 2))
-    fa = float(np.mean(alert[y == 0])) if (y == 0).any() else float("nan")
-    # an "event" onset = 0->1 transition of the label; lead = steps back (<= tau) to the earliest alert
-    onsets = np.flatnonzero((y[1:] == 1) & (y[:-1] == 0)) + 1
+def alert_metrics(prob: np.ndarray, y: np.ndarray):
+    """
+    Score quality against the FUTURE-WINDOW label y (label_t = instability inside (t, t+tau]):
+    AUROC, AUPRC (tie-grouped), Brier.  This says nothing about lead time or false alarms per unit
+    time - those need a realised-event clock, see `event_alert_metrics`.
+    """
+    return dict(auroc=auroc(prob, y), auprc=auprc(prob, y), brier=float(np.mean((prob - y) ** 2)))
+
+
+def realised_onsets(signal: np.ndarray, thr: float, refractory: int, seg: Optional[np.ndarray] = None):
+    """
+    Realised event onsets: rows where `signal` (an OBSERVED shock magnitude at that row, e.g. |return|)
+    first exceeds `thr`; further exceedances within `refractory` rows of an onset, or in the same
+    episode, are merged.  Onsets are found per segment (stock/day) so nothing crosses a join.
+    """
+    signal = np.asarray(signal); n = len(signal)
+    seg = np.zeros(n, dtype=np.int64) if seg is None else np.asarray(seg)
+    onsets, last = [], {}
+    for t in np.flatnonzero(signal > thr):
+        sg = seg[t]
+        if sg in last and t - last[sg] <= refractory:
+            last[sg] = t if t - last[sg] <= 1 else last[sg]       # extend only a contiguous exceedance run
+            continue
+        onsets.append(int(t)); last[sg] = int(t)
+    return np.array(onsets, dtype=np.int64)
+
+
+def event_alert_metrics(alert: np.ndarray, onsets: np.ndarray, tau: int, seg: Optional[np.ndarray] = None,
+                        rows_per_unit_time: Optional[float] = None, refractory: Optional[int] = None):
+    """
+    Event-based warning evaluation on ONE row clock (concatenated rows + segment ids).
+
+    * alert[t] True = an alert is raised at row t (e.g. calibrated prob >= validation threshold)
+    * an event at row r is DETECTED if some alert lies in [r - tau, r) inside the same segment;
+      lead = r - (earliest such alert row), in rows (convert with your clock afterwards)
+    * alert EPISODES: contiguous alert runs, merged if separated by <= `refractory` (default tau)
+      rows, never merged across segments.  A FALSE ALERT is an episode with no event in
+      (episode start, start + tau] inside its segment.
+    * false_alerts_per_unit_time uses `rows_per_unit_time` (e.g. rows per hour) when given.
+    """
+    alert = np.asarray(alert, dtype=bool); n = len(alert)
+    seg = np.zeros(n, dtype=np.int64) if seg is None else np.asarray(seg)
+    onsets = np.asarray(onsets, dtype=np.int64)
+    refractory = tau if refractory is None else refractory
     leads = []
-    for t in onsets:
-        w = alert[max(0, t - tau): t]
-        if w.any():
-            leads.append(len(w) - int(np.argmax(w)))
-    return dict(auroc=auroc(prob, y), auprc=auprc(prob, y), brier=brier, false_alarm_rate=fa,
-                events=int(len(onsets)), detected=len(leads),
-                mean_lead=float(np.mean(leads)) if leads else float("nan"))
+    for r in onsets:
+        lo = max(0, r - tau)
+        w = np.flatnonzero(alert[lo:r] & (seg[lo:r] == seg[r]))
+        if len(w): leads.append(int(r - (lo + w[0])))
+    # episodes
+    starts = []
+    idx = np.flatnonzero(alert)
+    prev = None
+    for t in idx:
+        if prev is None or seg[t] != seg[prev] or t - prev > refractory + 1:
+            starts.append(int(t))
+        prev = t
+    false_alerts = 0
+    for st in starts:
+        hi = min(n, st + tau + 1)
+        hit = np.any((onsets > st) & (onsets < hi) & (seg[np.minimum(onsets, n - 1)] == seg[st]))
+        false_alerts += int(not hit)
+    out = dict(events=int(len(onsets)), detected=len(leads),
+               detection_rate=(len(leads) / len(onsets)) if len(onsets) else float("nan"),
+               mean_lead_rows=float(np.mean(leads)) if leads else float("nan"),
+               alert_episodes=len(starts), false_alerts=false_alerts)
+    if rows_per_unit_time:
+        out["false_alerts_per_unit_time"] = false_alerts / (n / rows_per_unit_time)
+    return out
