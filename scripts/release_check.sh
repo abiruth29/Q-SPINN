@@ -3,7 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 pip install -r requirements.txt >/dev/null
-OUT=docs/TEST_LOG_latest.txt
+mkdir -p release_logs
+OUT=release_logs/release_check_$(date -u +%Y%m%d_%H%M%S).txt     # git-ignored: running the check never dirties the tree
 {
   echo "# Release test log (QSPINN_REQUIRE_FULL=1: skips are failures)"
   date -u +"%Y-%m-%d %H:%M UTC"; python -V
@@ -18,3 +19,4 @@ PY
   echo
   QSPINN_REQUIRE_FULL=1 python -m pytest tests -q -rs -p no:cacheprovider
 } 2>&1 | tee "$OUT"
+echo "Log saved to $OUT"

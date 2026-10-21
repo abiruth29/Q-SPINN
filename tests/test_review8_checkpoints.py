@@ -74,3 +74,27 @@ def test_suite_does_not_blame_jobs_it_did_not_run(tmp_path, monkeypatch):
     text = "\n".join(logs)
     assert rc == 0                                                  # the old failure belongs to a job this run did not execute
     assert "Earlier FAILED job(s) NOT run this time: fi2010_k10_s0" in text
+
+
+def test_completed_job_with_missing_or_different_signature_is_rerun_not_skipped(tmp_path, monkeypatch):
+    import json, run_unattended_suite as S
+    from qspinn_core import PROTOCOL_VERSION
+    monkeypatch.setattr(S, "STATE_FILE", tmp_path / "state.json", raising=False)
+    monkeypatch.setattr(S, "LOG_FILE", tmp_path / "suite.log", raising=False)
+    monkeypatch.setattr(S, "MASTER_MD", tmp_path / "m.md", raising=False)
+    monkeypatch.setattr(S, "ATTEMPTED", set()); monkeypatch.setattr(S, "SKIPPED", set())
+    calls = []
+    # an old COMPLETED record (e.g. the invalid first smoke run) has no signature -> must re-run
+    (tmp_path / "state.json").write_text(json.dumps({"jobs": {"j": {"status": "COMPLETED", "protocol": PROTOCOL_VERSION,
+                                                                    "metrics": {"x": 1}}}}), encoding="utf-8")
+    S.run_job("j", "d", lambda **k: calls.append(1) or {"x": 2}, epochs_a=1)
+    assert calls == [1] and "j" not in S.SKIPPED
+    S.run_job("j", "d", lambda **k: calls.append(2) or {"x": 3}, epochs_a=1)       # identical config -> skipped
+    assert calls == [1] and "j" in S.SKIPPED
+    S.run_job("j", "d", lambda **k: calls.append(3) or {"x": 4}, epochs_a=50)      # different config -> re-run
+    assert calls == [1, 3]
+
+
+def test_release_check_does_not_write_tracked_files():
+    t = (ROOT / "scripts" / "release_check.sh").read_text(encoding="utf-8")
+    assert "release_logs/" in t and "docs/TEST_LOG_latest.txt" not in t

@@ -67,3 +67,4 @@ Thumbs.db
 experiments/suite_state*.json
 experiments/_smoke/
 experiments/**/checkpoint*.pt
+release_logs/

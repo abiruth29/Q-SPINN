@@ -216,21 +216,35 @@ Validates cross-asset Magnetic Graph Laplacian coupling on Binance microstructur
 
 
 SMOKE_DIR = Path(__file__).resolve().parent / "_smoke"   # smoke runs never touch the real result folders
+SKIPPED: set = set()        # jobs found COMPLETED with an identical signature (not re-run)
 ATTEMPTED: set = set()      # job ids this invocation actually ran or resumed (older failures are reported separately)
+
+
+def _job_signature(job_id: str, kwargs: dict) -> str:
+    """Identity of a job run: its configuration (epochs, ticks, smoke/full via out_dir presence, ...)."""
+    from checkpoint import fingerprint_of
+    return fingerprint_of(job=job_id, smoke=("out_dir" in kwargs),
+                          cfg={k: v for k, v in kwargs.items() if k != "out_dir"})
 
 
 def run_job(job_id: str, desc: str, fn, *args, **kwargs):
     ATTEMPTED.add(job_id)
     state = load_state()
     from qspinn_core import PROTOCOL_VERSION
+    sig = _job_signature(job_id, kwargs)
     old = state["jobs"].get(job_id, {})
+    if old.get("status") == "COMPLETED" and old.get("protocol") == PROTOCOL_VERSION and old.get("signature") != sig:
+        log(f"♻️  [STALE-CONFIG] {job_id}: earlier COMPLETED record has a different (or no) run signature "
+            "(e.g. a smoke run or an older configuration) -> ignoring it and re-running.")
+        state["jobs"].pop(job_id); save_state(state)
     if old.get("status") == "COMPLETED" and old.get("protocol") != PROTOCOL_VERSION:
         log(f"♻️  [STALE] {job_id}: completed under protocol {old.get('protocol')!r}, current is "
             f"{PROTOCOL_VERSION!r} -> ignoring legacy result and retraining.")
         state["jobs"].pop(job_id)
         save_state(state)
     if job_id in state["jobs"] and state["jobs"][job_id].get("status") == "COMPLETED":
-        log(f"⏩ [SKIP] {desc} (Already marked COMPLETED in suite_state.json)")
+        SKIPPED.add(job_id)
+        log(f"⏩ [SKIP] {desc} (already COMPLETED with an identical configuration; use --reset to force a re-run)")
         return state["jobs"][job_id].get("metrics")
 
     log("=" * 70)
@@ -253,6 +267,7 @@ def run_job(job_id: str, desc: str, fn, *args, **kwargs):
         state["jobs"][job_id] = {
             "status": "COMPLETED",
             "protocol": PROTOCOL_VERSION,
+            "signature": sig,
             "completed_at": datetime.now().isoformat(),
             "elapsed_seconds": elapsed,
             "metrics": metrics
@@ -336,7 +351,9 @@ def main():
     state = load_state()
     jobs = state.get("jobs", {})
     failed = sorted(j for j, v in jobs.items() if v.get("status") == "FAILED" and j in ATTEMPTED)
-    ok = sorted(j for j, v in jobs.items() if v.get("status") not in (None, "FAILED") and j in ATTEMPTED)
+    ok = sorted(j for j, v in jobs.items() if v.get("status") not in (None, "FAILED") and j in ATTEMPTED
+                and j not in SKIPPED)
+    skipped = sorted(j for j in SKIPPED if j in ATTEMPTED)
     stale_failed = sorted(j for j, v in jobs.items() if v.get("status") == "FAILED" and j not in ATTEMPTED)
     state["finished_at"] = datetime.now().isoformat()
     state["n_failed"] = len(failed)
@@ -351,7 +368,7 @@ def main():
         log(f"     Succeeded: {', '.join(ok) if ok else 'none'}")
         log("     Read the error above/in the state file, fix the cause, then re-run (finished jobs are skipped).")
     else:
-        log(f"  ✅ ALL {len(ok)} JOB(S) RUN IN THIS INVOCATION SUCCEEDED")
+        log(f"  ✅ {len(ok)} JOB(S) RAN AND SUCCEEDED" + (f"; {len(skipped)} SKIPPED (already completed: {', '.join(skipped)})" if skipped else ""))
     if stale_failed:
         log(f"  ℹ️  Earlier FAILED job(s) NOT run this time: {', '.join(stale_failed)}")
     log(f"  Master Report Available at: {MASTER_MD}")

@@ -151,3 +151,7 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
   and delete `experiments/state*.json` / suite state files if present (the runner will rebuild them).
 - Exp C now also reports a **past-return lookup baseline** (rule: sign/size of the last 5 s return -> train-majority label). The LSTM's ~0.57 accuracy on a balanced 3-class 5 s task is suspiciously high; a learned model's accuracy only counts as signal if it clearly beats this rule. Report both.
 - The suite summary only blames jobs run in the current invocation; older failures are listed as "not run this time".
+
+## Review-9 additions
+- `scripts/release_check.sh` now writes its log to `release_logs/` (git-ignored), so running it never dirties the working tree. If `docs/TEST_LOG_latest.txt` shows as modified from an earlier run, restore it: `git restore docs/TEST_LOG_latest.txt` (it is only a reference sample).
+- The suite only SKIPS a completed job when its recorded run signature (job + epochs/ticks + smoke-or-full) matches the current invocation. An older COMPLETED record without a matching signature (e.g. the invalid first smoke run) is re-run automatically. `--reset` forces a fresh start. The summary now says "N ran and succeeded; M skipped".
