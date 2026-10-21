@@ -79,18 +79,18 @@ the training logs, and the CPU/GPU model names. Commit them under `results/v3.1/
 * Item 19: drift-Jacobian / anti-collapse ablation.
 * Item 20: cross-asset lead-lag research on aligned series (the aligned data pipeline is ready; the study is not written).
 
-## 8. Item → code map
+## 8. Change → code map
 
-| # | Change | Where | Tests |
-|---|---|---|---|
-| 01 | finite-check/clip **before** `opt.step()` | `qspinn_core.safe_step` | `test_phase0_core.py` |
-| 02 | covariance flag (skip Van Loan/cov_head) | `QSPINN.use_cov` | `test_phase0_core.py` |
-| 03 | deterministic Stage C (heavy frozen/eval/no-grad) | `qspinn_core.freeze_for_gate_training` | `test_phase0_core.py` |
-| 04 | calibrated encoder, fixed dt | `qspinn_core.SpikeEncoder` | `test_phase0_core.py` |
-| 05 | exact binary hand-over | `qspinn_core.route_exact` | `test_phase0_core.py` |
-| 06 | bookkeeping (global rate, last window) | `RateMeter`, `window_starts` | `test_phase0_*.py` |
-| 07 | FI-2010 Setup 2 + segments | `fi2010_setup2.py` | `test_phase1_setup2.py` |
-| 08 | independent S/H, single generator, causal residual | `qspinn_core` generator | `test_phase1_generator.py` |
-| 09 | Binance common 1 s clock | `binance_align.py` | `test_phase1_binance_align.py` |
-| 10–12 | budgeted routing, conditional inference, early warning | `routing.py` + two drivers | `test_phase2_*.py` |
-| 13–15 | controlled baselines, intervals, claims cleanup, live contract | `baselines.py`, `stats.py`, README, `live_contract.py` | `test_phase3_*.py` |
+| Change | Where | Tests |
+|---|---|---|
+| finite-check/clip **before** `opt.step()` | `qspinn_core.StepGuard` | `test_phase0_core.py` |
+| covariance flag (skip Van Loan / cov_head); `QSPINN_USE_COV=1` re-enables | `QSPINN.use_cov` | `test_phase0_core.py` |
+| deterministic Stage C (heavy frozen / eval / no-grad) | `qspinn_core.stage_c_mode`, `heavy_teacher_ctx` | `test_phase0_core.py` |
+| calibrated train-only encoder, fixed dt | `qspinn_core.SpikeEncoder` | `test_phase0_core.py` |
+| exact binary hand-over | `qspinn_core.route_exact` | `test_phase0_core.py` |
+| bookkeeping (global gate rate, last window kept) | `RateMeter`, `window_starts` | `test_phase0_*.py` |
+| independent S/H, single generator exp((S−iH)dt), causal residual | `qspinn_core.propagate` and Exp B/C `HamiltonianNet` | `test_phase1_generator.py` |
+| FI-2010 Setup 2 + stock/day segments | `fi2010_setup2.py`, `procure_fi2010.py --setup2` | `test_phase1_setup2.py` |
+| Binance common 1 s clock, train-only labels | `binance_align.py` | `test_phase1_binance_align.py` |
+| budgeted routing, conditional inference, early warning | `routing.py` + two drivers | `test_phase2_*.py` |
+| DeepLOB baseline, intervals, claims cleanup, live contract | `baselines.py`, `stats.py`, README, `live_contract.py` | `test_phase3_*.py` |
