@@ -432,7 +432,7 @@ _BATCH = 2_000_000
 _AGG_OPS = {
     "mid_sum": "sum", "mid_count": "sum", "signed_volume": "sum",
     "buy_vol": "sum", "sell_vol":  "sum", "trade_count": "sum",
-    "total_pq": "sum", "total_qty": "sum",
+    "total_pq": "sum", "total_qty": "sum", "last_price": "last",   # rows are time-ordered, so 'last' = last trade
 }
 
 def _batch_to_seconds(batch, time_col="time"):
@@ -462,6 +462,7 @@ def _batch_to_seconds(batch, time_col="time"):
         "trade_count": g["qty"].count(),
         "total_pq"   : g["price_qty"].sum(),
         "total_qty"  : g["qty"].sum(),
+        "last_price" : g["price"].last(),
     })
 
 
@@ -494,7 +495,7 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
     return pd.concat(all_second_dfs).groupby(level=0).agg(_AGG_OPS).sort_index()
 
 
-def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS):
+def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS, price_mode="mean"):
     from binance_align import align_on_grid, frame_to_features, forward_labels, gap_fraction, assert_no_long_outage
     log.section("Loading & Engineering 3-Asset Binance Trade Streams (common 1 s clock)")
     syms = ["symbol=BTCUSDT", "symbol=ETHUSDT", "symbol=SOLUSDT"]
@@ -506,7 +507,8 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
         raw.append(f)
         log.info(f"  {name}: {len(f):,} non-empty seconds  [{f.index.min()} .. {f.index.max()}]")
 
-    aligned, grid = align_on_grid(raw)
+    log.info(f"Price series: {price_mode} trade price per second")
+    aligned, grid = align_on_grid(raw, price_mode=price_mode)
     gf = gap_fraction(aligned)
     log.metric("Seconds inside a >300 s outage of any asset", gf * 100, unit="%")
     assert_no_long_outage(aligned, grid)     # fail closed on ANY flagged outage (not a dataset-wide percentage)
@@ -888,7 +890,7 @@ def train_lstm(Xtr, ytr, Xva, yva, device, epochs=15):
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
-def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy", out_dir=None, seed=None):
+def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy", out_dir=None, seed=None, price_mode="mean"):
     global OUT_DIR, CKPT_PATH
     seed = SEED if seed is None else int(seed)
     if out_dir is not None:                       # smoke/trial runs must never touch the real output folder
@@ -897,7 +899,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     log = ExperimentLogger(OUT_DIR / "train.log", experiment_name="Exp C — 3-Asset Binance Basket")
     device = get_device(verbose=True)
 
-    feats, labels, regime = build_binance_multi_asset_data(log, max_ticks=max_ticks)
+    feats, labels, regime = build_binance_multi_asset_data(log, max_ticks=max_ticks, price_mode=price_mode)
     log.section("Partitioning Trailing Windows")
     Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, Xte, yte, rte, dt_te = make_windows_binance(feats, labels, regime)
 
@@ -914,7 +916,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
                                        tail=float(np.round(np.asarray(feats[-2000:], dtype=np.float64).sum(), 6)),
                                        seq=SEQ_LEN, horizon=HORIZON, tf=TRAIN_FRAC, vf=VAL_FRAC, seed=seed,
                                        epochs=[epochs_a, epochs_b, epochs_c], max_ticks=max_ticks,
-                                       batch=batch_size, gate=gate_objective))
+                                       batch=batch_size, gate=gate_objective, price=price_mode))
     model = MultiAssetQSPINN(n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS).to(device)
     # Task 04: encoder thresholds from TRAIN rows only (windows have stride 1 -> rebuild the row series)
     model.encoder.fit(torch.cat([Xtr[:, 0], Xtr[-1, 1:]]).numpy())

@@ -87,11 +87,16 @@ def main():
     C = importlib.util.module_from_spec(spec); sys.modules["expC_diag"] = C; spec.loader.exec_module(C)
     from binance_align import align_on_grid
     frames = [C.engineer_features_for_symbol(C.DATA_DIR / f"symbol={s}", a.max_ticks) for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT")]
-    aligned, grid = align_on_grid(frames)
-    btc = aligned[0]
-    d = diagnose(btc["mid_price"].values, btc["stale"].values, horizon=C.HORIZON, seq_len=C.SEQ_LEN, train_frac=C.TRAIN_FRAC)
-    for k, v in d.items():
-        print(f"{k:42s} {v}")
+    out = {}
+    for mode in ("mean", "last"):
+        aligned, grid = align_on_grid(frames, price_mode=mode)
+        btc = aligned[0]
+        d = diagnose(btc["mid_price"].values, btc["stale"].values, horizon=C.HORIZON, seq_len=C.SEQ_LEN, train_frac=C.TRAIN_FRAC)
+        out[mode] = d
+        print(f"\n=== price_mode = {mode} ===")
+        for k, v in d.items():
+            print(f"{k:42s} {v}")
+    d = out
     Path(a.out).write_text(json.dumps(d, indent=2), encoding="utf-8")
     print(f"\nwrote {a.out}")
 

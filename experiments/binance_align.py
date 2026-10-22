@@ -16,7 +16,7 @@ FLOW_COLS = ["signed_volume", "buy_vol", "sell_vol", "trade_count", "total_pq", 
 PRICE_COLS = ["mid_sum", "mid_count"]
 
 
-def align_on_grid(frames, max_gap: int = 300):
+def align_on_grid(frames, max_gap: int = 300, price_mode: str = "mean"):
     """
     frames: list of DataFrames indexed by integer unix-second with the raw per-second aggregate
     columns.  Returns (list of frames on the shared grid, grid index).  Grid = [max(first), min(last)]
@@ -25,7 +25,11 @@ def align_on_grid(frames, max_gap: int = 300):
       stale     1 if no trade in that second
       age       seconds since the last real trade
       long_gap  1 if age > max_gap (data outage; callers must exclude/handle, see `gap_fraction`)
+    price_mode: "mean" = per-second mean trade price (legacy; smooths the series and inflates lag-1 return
+    autocorrelation); "last" = last trade of each second (needs a `last_price` column).
     """
+    if price_mode not in ("mean", "last"):
+        raise ValueError(f"price_mode must be 'mean' or 'last', got {price_mode!r}")
     lo = max(int(f.index.min()) for f in frames)
     hi = min(int(f.index.max()) for f in frames)
     if hi <= lo:
@@ -34,7 +38,12 @@ def align_on_grid(frames, max_gap: int = 300):
     out = []
     for f in frames:
         f = f.sort_index()
-        mid_obs = (f["mid_sum"] / f["mid_count"].where(f["mid_count"] > 0))
+        if price_mode == "last":
+            if "last_price" not in f.columns:
+                raise ValueError("price_mode='last' needs a last_price column (rebuild with Exp C engineer_features)")
+            mid_obs = f["last_price"].where(f["mid_count"] > 0)
+        else:
+            mid_obs = (f["mid_sum"] / f["mid_count"].where(f["mid_count"] > 0))
         obs_t = pd.Series(f.index.values.astype(np.int64), index=f.index).where(mid_obs.notna())
         union = f.index.union(grid)
         mid = mid_obs.reindex(union).ffill().reindex(grid)        # last price at-or-before t (pre-grid seed included)

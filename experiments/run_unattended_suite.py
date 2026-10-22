@@ -304,6 +304,10 @@ def main():
     parser.add_argument("--gate_objective", choices=["legacy", "benefit"], default="legacy",
                         help="Gate training objective for Exp B and Exp C (non-default runs get their own job id / output dir)")
     parser.add_argument("--seed", type=int, default=None, help="Exp C seed (default 0); run >=5 seeds before reporting loop flux")
+    parser.add_argument("--price_mode", choices=["mean", "last"], default="mean",
+                        help="Exp C price series: per-second mean trade price (legacy) or last trade of the second")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override Exp C epochs per stage (default 50; validation F1 plateaus by ~15-20)")
     args = parser.parse_args()
     gsuf = "" if args.gate_objective == "legacy" else f"_{args.gate_objective}"
     gkw = {} if args.gate_objective == "legacy" else {"gate_objective": args.gate_objective}
@@ -325,7 +329,7 @@ def main():
     ep_a = 1 if args.test else 100
     ep_b = 1 if args.test else 100
     ep_c = 1 if args.test else 100
-    binance_ep = 1 if args.test else 50
+    binance_ep = 1 if args.test else (args.epochs or 50)
     binance_ticks = 25_000 if args.test else 350_000
 
     from exp_B_hybrid_fi2010.train import main as train_fi2010
@@ -344,8 +348,11 @@ def main():
     if not args.skip_binance:
         # ── 5. Binance 3-Asset Basket (BTC, ETH, SOL with Magnetic Laplacian)
         from exp_C_multi_asset_binance.train import main as train_binance
-        csuf = gsuf + (f"_s{args.seed}" if args.seed is not None else "")
-        ckw = dict(gkw, **({"seed": args.seed} if args.seed is not None else {}))
+        csuf = (gsuf + (f"_{args.price_mode}" if args.price_mode != "mean" else "")
+                + (f"_s{args.seed}" if args.seed is not None else "")
+                + (f"_e{args.epochs}" if args.epochs and not args.test else ""))
+        ckw = dict(gkw, **({"seed": args.seed} if args.seed is not None else {}),
+                   **({"price_mode": args.price_mode} if args.price_mode != "mean" else {}))
         run_job(
             f"binance_3asset{csuf}",
             f"Binance 3-Asset Hybrid with Magnetic Graph Laplacian (BTC, ETH, SOL), gate={args.gate_objective}",

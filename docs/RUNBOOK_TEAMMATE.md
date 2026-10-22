@@ -166,3 +166,13 @@ The smoke run (1 epoch per stage, `experiments/_smoke/exp_C/`) validated the pip
 2. **Full Exp C run (about 4–5 h on the RTX 3060):** `python experiments/run_unattended_suite.py --only-binance` (no `--test`, no `--reset` unless you intend to restart). Send the log and `experiments/exp_C_multi_asset_binance/RESULTS.md`.
 3. **Benefit-vs-legacy gate study:** repeat with `--gate_objective benefit` (own job id and output dir under `experiments/runs/`).
 4. **Loop flux:** it changed sign between runs (+0.18, then −1.30). Run `--seed 0..4` and report the loop flux across at least 5 seeds with intervals. Make no lead-lag claim unless the interval excludes zero and holds on the held-out split.
+
+## Review 11 — first full Exp C run (mean-price series, legacy gate, seed 0, 50 epochs/stage, 4.0 h)
+
+Result (single seed, not yet a claim): LSTM 0.579, PINN-only 0.583, SNN-only 0.537, hybrid 0.539 at gate 3.7%, naive past-return lookup 0.493, majority 0.366. Hybrid accuracy equals what random routing at the same gate rate would give (0.537 + 0.037·(0.583−0.537) ≈ 0.539), so there is no evidence yet that the gate picks useful samples. Loop flux −1.06 rad (earlier runs +0.18, −1.30): not interpretable.
+
+Next runs, in this order (validation F1 plateaus by epoch ~15–20, so 20 epochs is enough for the seed sweeps, about 1.7 h each):
+1. `python experiments/exp_C_multi_asset_binance/label_diagnostics.py` (now compares the mean and last-trade price series).
+2. `python experiments/run_unattended_suite.py --only-binance --price_mode last --epochs 20` (does the accuracy survive without the within-second averaging?).
+3. `python experiments/run_unattended_suite.py --only-binance --gate_objective benefit --epochs 20`.
+4. Seeds 0–4 of the better configuration: `--seed N --epochs 20`.
