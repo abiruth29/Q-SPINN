@@ -12,9 +12,9 @@ WHAT THIS DOES
 3. Trains the full 3-asset Q-SPINN incorporating:
    - Continuous-time Magnetic Graph Laplacian (directed phase flux W_ij = A_ij * exp(i*Phi_ij))
    - Van Loan Continuous-to-Discrete Covariance Propagation
-   - Early Warning System (Numerical Abscissa contractive regularization)
+   - Concurrent-regime alignment of the numerical abscissa ω (diagnostic, not a forward predictor)
    - Event-driven SNN Gating
-4. Evaluates lead-lag relationships (BTC phase lead over ETH and SOL).
+4. Reports the gauge-invariant loop flux of the learned phase matrix (no lead-lag claim).
 5. Compares against SNN-only, PINN-only, and LSTM baselines.
 6. Saves model weights and generates RESULTS.md.
 """
@@ -27,7 +27,6 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
-import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,7 +38,18 @@ sys.path.insert(0, str(ROOT / "experiments"))
 
 from device import get_device
 from logger import ExperimentLogger
-from checkpoint import save_checkpoint, load_checkpoint, guard_nan
+from checkpoint import save_checkpoint, load_checkpoint, guard_nan, fingerprint_of, set_run_fingerprint
+from qspinn_core import (expert_benefit, benefit_gate_loss, propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
+                         StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
+                         stage_c_mode, heavy_teacher_ctx)
+import os
+USE_COVARIANCE = os.environ.get("QSPINN_USE_COV", "0") == "1"   # Task 02: off by default
+# v3.1 generator settings (Tasks 08-10)
+LAMBDA_SCALE = float(os.environ.get("QSPINN_LAMBDA_SCALE", "1.0"))   # weight of the scale anchor (0 disables = ablation)
+RESIDUAL_MODE = os.environ.get("QSPINN_RESIDUAL", "last")   # 'last' (causal) | 'all' (legacy ablation)
+H_FRO_MAX = 2.0     # spectral control on H
+S_FRO_MAX = 1.0     # spectral control on S (growth per step <= e^1)
+MAX_GRAD_NORM = 1.0                                              # Task 01
 
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
@@ -48,7 +58,7 @@ if torch.cuda.is_available():
 
 # ── hyper-parameters ─────────────────────────────────────────────────────────
 N_ASSETS        = 3
-FEATS_PER_ASSET = 6           # log_return, ofi, realized_vol, buy_pressure, trade_count, vwap_spread
+FEATS_PER_ASSET = 6           # log_return, signed_volume, realized_vol, buy_pressure, trade_count, vwap_spread
 N_FEATURES      = N_ASSETS * FEATS_PER_ASSET   # 18
 PSI_DIM         = 8           # Dimension per asset -> Total Psi Dim = 24
 HIDDEN          = 64
@@ -92,7 +102,7 @@ class IrregularLIFLayer(nn.Module):
         super().__init__()
         self.fc = nn.Linear(n_in, n_out)
         self.tau_m = nn.Parameter(torch.tensor(tau_m))
-        self.alpha = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha", torch.tensor(2.0))   # FIXED surrogate slope
 
     def forward(self, x_seq, dt_seq):
         B, T, _ = x_seq.shape
@@ -136,7 +146,8 @@ class ComplexAmplitudeLayer(nn.Module):
         return psi / n.to(psi.dtype)
 
     def forward(self, x):
-        return self.normalise(torch.complex(self.to_real(x), self.to_imag(x)))
+        # v3.1 (Task 09): dynamical state stays UNNORMALISED; readout normalises a copy.
+        return torch.complex(self.to_real(x), self.to_imag(x))
 
     @staticmethod
     def density_features(psi):
@@ -155,7 +166,7 @@ class HamiltonianNet(nn.Module):
         self.d = d
         self.n_assets = n_assets
         
-        out_dim = (n_assets * 2 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
+        out_dim = (n_assets * 3 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
         self.net = nn.Sequential(nn.Linear(n_in, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, out_dim))
         
         self.theta = nn.Parameter(torch.full((n_assets,), 0.1))
@@ -163,7 +174,7 @@ class HamiltonianNet(nn.Module):
         self.log_R = nn.Parameter(torch.full((n_assets,), -2.0))
         self.scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, velocities):
+    def forward(self, velocities, with_prefix=False):
         B, seq_len, _ = velocities.shape
         
         Q = torch.exp(self.log_Q).view(1, self.n_assets, 1, 1, 1)
@@ -177,14 +188,16 @@ class HamiltonianNet(nn.Module):
             v_t = velocities[:, t, :]
             out = self.net(v_t)
             
-            mu_raw = out[:, :self.n_assets * 2 * self.d * self.d]
-            mu_t  = mu_raw.view(B, self.n_assets, 2, self.d, self.d)
+            mu_raw = out[:, :self.n_assets * 3 * self.d * self.d]
+            mu_t  = mu_raw.view(B, self.n_assets, 3, self.d, self.d)
             
-            if t == seq_len - 1:
-                idx_A = self.n_assets * 2 * self.d * self.d
+            if t >= seq_len - 2:          # last two steps: keep graph heads for the prefix and full generators
+                idx_A = self.n_assets * 3 * self.d * self.d
                 idx_Phi = idx_A + self.n_assets * self.n_assets
-                A_raw   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
-                Phi_raw = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
+                A_t   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
+                Phi_t = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
+                if t == seq_len - 2: A_pre, Phi_pre = A_t, Phi_t
+                if t == seq_len - 1: A_raw, Phi_raw = A_t, Phi_t
             
             if z_t is None:
                 z_t = mu_t
@@ -195,7 +208,19 @@ class HamiltonianNet(nn.Module):
                 K_t = P_pred / (P_pred + R)
                 z_t = z_pred + K_t * (mu_t - z_pred)
                 P_t = (1 - K_t) * P_pred
+            if t == seq_len - 2:          # filtered state using observations up to (and incl.) step T-2 only
+                z_pre, P_pre = z_t, P_t
         
+        full = self._assemble(z_t, P_t, A_raw, Phi_raw, B, velocities.device)
+        if not with_prefix:
+            return full
+        if seq_len >= 2:
+            return full, self._assemble(z_pre, P_pre, A_pre, Phi_pre, B, velocities.device)
+        zero = tuple(torch.zeros_like(t_) if torch.is_tensor(t_) else t_ for t_ in full)
+        return full, zero      # 1 velocity step: no causal prefix -> identity residual generator
+
+
+    def _assemble(self, z_t, P_t, A_raw, Phi_raw, B, device):
         if self.training:
             epsilon = torch.randn_like(z_t)
             std = torch.sqrt(P_t + 1e-6)
@@ -203,12 +228,11 @@ class HamiltonianNet(nn.Module):
         else:
             z_final = z_t
             
-        A_local = torch.complex(z_final[:, :, 0], z_final[:, :, 1])
-        H_local = 0.5 * (A_local + A_local.conj().transpose(-1, -2))
-        
-        R_local = z_final[:, :, 0]
-        S_local = 0.5 * (R_local + R_local.transpose(-1, -2))
-        
+        # v3.1 (Task 08): S and H are INDEPENDENT.  channel 0 -> S (real symmetric, gain/loss),
+        # channels 1,2 -> Re/Im of H (Hermitian, conservative).  Previously S was Re(H).
+        S_local = symmetric_from_raw(z_final[:, :, 0])
+        H_local = hermitian_from_raw(z_final[:, :, 1], z_final[:, :, 2])
+
         # Magnetic Graph Laplacian Construction
         A_sym = F.softplus(A_raw + A_raw.transpose(-1, -2))
         Phi_anti = Phi_raw - Phi_raw.transpose(-1, -2)
@@ -219,9 +243,9 @@ class HamiltonianNet(nn.Module):
         L = torch.complex(D, torch.zeros_like(D)) - W
         
         # Kronecker coupling: H_tot = BlockDiag(H_k) + L (x) I_d
-        H_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.complex64, device=velocities.device)
-        S_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.float32, device=velocities.device)
-        I_d = torch.eye(self.d, dtype=torch.complex64, device=velocities.device)
+        H_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.complex64, device=device)
+        S_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.float32, device=device)
+        I_d = torch.eye(self.d, dtype=torch.complex64, device=device)
         
         for i in range(self.n_assets):
             for j in range(self.n_assets):
@@ -233,7 +257,7 @@ class HamiltonianNet(nn.Module):
                 else:
                     H_tot[:, si:ei, sj:ej] = L[:, i, j].view(B, 1, 1) * I_d
                     
-        return self.scale * H_tot, self.scale * S_tot, A_sym, Phi_anti
+        return (bound_fro(self.scale * H_tot, H_FRO_MAX), bound_fro(self.scale * S_tot, S_FRO_MAX), A_sym, Phi_anti)
 
 
 # ── Van Loan Propagator ───────────────────────────────────────────────────────
@@ -271,7 +295,7 @@ class SNNGate(nn.Module):
         self.lif2       = IrregularLIFLayer(HIDDEN, HIDDEN)
         self.cheap_head = LeakyReadout(HIDDEN, 3)
         self.gate_head  = LeakyReadout(HIDDEN, 1)
-        self.alpha_gate = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha_gate", torch.tensor(2.0))   # FIXED surrogate slope
         nn.init.constant_(self.gate_head.fc.bias, 0.5)
 
     def forward(self, spikes, dt_seq):
@@ -286,8 +310,11 @@ class SNNGate(nn.Module):
 
 # ── Multi-Asset Q-SPINN ──────────────────────────────────────────────────────
 class MultiAssetQSPINN(nn.Module):
-    def __init__(self, n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS):
+    def __init__(self, n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS, use_cov=None):
         super().__init__()
+        self.use_cov = USE_COVARIANCE if use_cov is None else use_cov
+        self.heavy_frozen = False
+        self.encoder = SpikeEncoder(n_in)
         self.gate = SNNGate(n_in=n_in)
         self.amp  = ComplexAmplitudeLayer(n_in=n_in, d=d, n_assets=n_assets)
         self.ham  = HamiltonianNet(n_in=n_in, d=d, n_assets=n_assets)
@@ -301,13 +328,11 @@ class MultiAssetQSPINN(nn.Module):
         self.cov_head = nn.Sequential(nn.Linear(total_psi_dim * 2, HIDDEN), nn.ReLU(), nn.Linear(HIDDEN, n_cov))
         
         self.log_var_ce     = nn.Parameter(torch.tensor(0.0))
-        self.log_var_gate   = nn.Parameter(torch.tensor(0.0))
         self.log_var_regime = nn.Parameter(torch.tensor(0.0))
 
     def heavy_path(self, x):
-        psi = self.amp(x)
         velocities = x[:, 1:] - x[:, :-1]
-        H_tot, S_tot, A_sym, Phi_anti = self.ham(velocities)
+        (H_tot, S_tot, A_sym, Phi_anti), (H_res, S_res, _, _) = self.ham(velocities, with_prefix=True)  # causal residual
         
         B, N, _ = H_tot.shape
         H_R = H_tot.real
@@ -316,46 +341,66 @@ class MultiAssetQSPINN(nn.Module):
         A_R_mat = S_tot + H_I
         A_I_mat = -H_R
         
-        A_block = torch.zeros(B, 2 * N, 2 * N, device=x.device, dtype=torch.float32)
-        A_block[:, :N, :N] = A_R_mat
-        A_block[:, :N, N:] = -A_I_mat
-        A_block[:, N:, :N] = A_I_mat
-        A_block[:, N:, N:] = A_R_mat
+        if self.use_cov:   # Task 02: Van Loan never executed when disabled
+            A_block = torch.zeros(B, 2 * N, 2 * N, device=x.device, dtype=torch.float32)
+            A_block[:, :N, :N] = A_R_mat
+            A_block[:, :N, N:] = -A_I_mat
+            A_block[:, N:, :N] = A_I_mat
+            A_block[:, N:, N:] = A_R_mat
         
-        F_mat, Q_h = self.van_loan(A_block, DT)
-        U = torch.matrix_exp(-1j * H_tot * DT)
+            F_mat, Q_h = self.van_loan(A_block, DT)
+        # Task 09/10: ONE generator A = S - iH drives the means; residuals are causal ('last').
+        psi = self.amp(x)     # unnormalised dynamical state
+        U, L_pde, L_norm_ = propagate(psi, H_tot, S_tot, DT, RESIDUAL_MODE, H_res=H_res, S_res=S_res)
+
+        if self.use_cov:
+            z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
+            Sigma_theta_flat = self.cov_head(z_T)
+            Sigma_theta = Sigma_theta_flat.view(B, 2 * N, 2 * N)
+            Sigma_theta = Sigma_theta @ Sigma_theta.transpose(-1, -2)
         
-        psi_pred = torch.einsum('bij,btj->bti', U, psi[:, :-1])
-        L_pde    = (psi[:, 1:] - psi_pred).abs().pow(2).mean()
+            R_Sigma = F_mat @ Sigma_theta @ F_mat.transpose(-1, -2) + Q_h - Sigma_theta
+            L_cov = R_Sigma.abs().pow(2).mean()
         
-        z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
-        Sigma_theta_flat = self.cov_head(z_T)
-        Sigma_theta = Sigma_theta_flat.view(B, 2 * N, 2 * N)
-        Sigma_theta = Sigma_theta @ Sigma_theta.transpose(-1, -2)
-        
-        R_Sigma = F_mat @ Sigma_theta @ F_mat.transpose(-1, -2) + Q_h - Sigma_theta
-        L_cov = R_Sigma.abs().pow(2).mean()
-        
-        norm_sq_t1 = psi[:, 1:].abs().pow(2).sum(dim=-1)
-        norm_sq_t0 = psi[:, :-1].abs().pow(2).sum(dim=-1)
-        d_norm_sq_dt = (norm_sq_t1 - norm_sq_t0) / DT
-        
-        psi_t0 = psi[:, :-1]
-        psi_t0_conj = psi_t0.conj()
-        S_tot_complex = S_tot.to(torch.complex64)
-        theoretical_expansion = 2 * torch.einsum('bti,bij,btj->bt', psi_t0_conj, S_tot_complex, psi_t0).real
-        
-        R_norm = d_norm_sq_dt - theoretical_expansion
-        L_norm = R_norm.abs().pow(2).mean()
-        
-        psi_T    = psi[:, -1]
-        psi_next = torch.einsum('bij,bj->bi', U, psi_T)
+        else:
+            L_cov = torch.zeros((), device=x.device)
+
+        L_norm = L_norm_ + LAMBDA_SCALE * scale_anchor(psi)   # norm balance + window-level non-collapse anchor
+
+        psi_T    = ComplexAmplitudeLayer.normalise(psi[:, -1])
+        psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))
         feats    = torch.cat([
             ComplexAmplitudeLayer.density_features(psi_T),
             ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),
             ComplexAmplitudeLayer.density_features(psi_next)], dim=-1)
             
         return self.head(feats), L_pde, H_tot, S_tot, L_cov, L_norm, A_sym, Phi_anti
+
+    @torch.no_grad()
+    def heavy_infer(self, x):
+        """Inference-only heavy expert: logits only (no residual generator / loss-only work)."""
+        H_tot, S_tot, _, _ = self.ham(x[:, 1:] - x[:, :-1])
+        psi = self.amp(x)
+        U = torch.matrix_exp((S_tot.to(torch.complex64) - 1j * H_tot) * DT)
+        psi_T = ComplexAmplitudeLayer.normalise(psi[:, -1])
+        psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))
+        feats = torch.cat([ComplexAmplitudeLayer.density_features(psi_T),
+                           ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),
+                           ComplexAmplitudeLayer.density_features(psi_next)], dim=-1)
+        return self.head(feats)
+
+    @torch.no_grad()
+    def infer(self, spikes, x, dt_seq, chunk=4096, sel=None):
+        """Deployed conditional inference: heavy expert only on gate-selected rows."""
+        self.eval()
+        cheap, g, _, _ = self.gate(spikes, dt_seq)
+        sel = (g > 0.5) if sel is None else sel      # `sel` override is for latency sweeps at a fixed routing fraction
+        out = cheap.clone()
+        idx = torch.nonzero(sel, as_tuple=False).squeeze(1)
+        for i in range(0, len(idx), chunk):
+            j = idx[i:i + chunk]
+            out[j] = self.heavy_infer(x[j])
+        return out, sel, int(len(idx))
 
     def forward(self, spikes, x, dt_seq, mode="learned"):
         cheap, g, rate, gl = self.gate(spikes, dt_seq)
@@ -367,20 +412,27 @@ class MultiAssetQSPINN(nn.Module):
             P0 = torch.zeros(1, N_ASSETS, N_ASSETS, device=spikes.device)
             return cheap, torch.zeros_like(g), rate, torch.zeros((), device=spikes.device), H0, S0, gl, torch.zeros((), device=spikes.device), torch.zeros((), device=spikes.device), A0, P0
             
-        heavy, L_pde, H, S, L_cov, L_norm, A_sym, Phi_anti = self.heavy_path(x)
+        if self.heavy_frozen:                      # Task 03
+            with heavy_teacher_ctx():
+                heavy, L_pde, H, S, L_cov, L_norm, A_sym, Phi_anti = self.heavy_path(x)
+        else:
+            heavy, L_pde, H, S, L_cov, L_norm, A_sym, Phi_anti = self.heavy_path(x)
         if mode == "dense":
             return heavy, torch.ones_like(g), rate, L_pde, H, S, gl, L_cov, L_norm, A_sym, Phi_anti
             
-        gm = (torch.sigmoid(gl) * g).unsqueeze(-1)
-        return gm * heavy + (1 - gm) * cheap, g, rate, L_pde, H, S, gl, L_cov, L_norm, A_sym, Phi_anti
+        # Task 05: exact binary hand-over (no logit attenuation)
+        return route_exact(cheap, heavy, g), g, rate, L_pde, H, S, gl, L_cov, L_norm, A_sym, Phi_anti
+
+    def encode(self, x):
+        return self.encoder(x)
 
 
 # ── data engineering ──────────────────────────────────────────────────────────
 _BATCH = 2_000_000
 _AGG_OPS = {
-    "mid_sum": "sum", "mid_count": "sum", "ofi": "sum",
+    "mid_sum": "sum", "mid_count": "sum", "signed_volume": "sum",
     "buy_vol": "sum", "sell_vol":  "sum", "trade_count": "sum",
-    "total_pq": "sum", "total_qty": "sum",
+    "total_pq": "sum", "total_qty": "sum", "last_price": "last",   # rows are time-ordered, so 'last' = last trade
 }
 
 def _batch_to_seconds(batch, time_col="time"):
@@ -404,19 +456,26 @@ def _batch_to_seconds(batch, time_col="time"):
     return pd.DataFrame({
         "mid_sum"    : g["price"].sum(),
         "mid_count"  : g["price"].count(),
-        "ofi"        : g["signed_qty"].sum(),
+        "signed_volume"        : g["signed_qty"].sum(),
         "buy_vol"    : g["qty_buy"].sum(),
         "sell_vol"   : g["qty_sell"].sum(),
         "trade_count": g["qty"].count(),
         "total_pq"   : g["price_qty"].sum(),
         "total_qty"  : g["qty"].sum(),
+        "last_price" : g["price"].last(),
     })
 
 
 def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
+    """Raw per-second aggregates INDEXED BY UNIX SECOND (timestamps kept - Task 11)."""
+    import pyarrow.parquet as pq   # lazy: unit tests don't need pyarrow
     import pandas as pd
-    files = sorted(symbol_dir.rglob("*.parquet"))
-    if not files: return None
+    files = sorted(symbol_dir.rglob("*.parquet")) if Path(symbol_dir).exists() else []
+    if not files:
+        raise FileNotFoundError(
+            f"No parquet trade files found under {symbol_dir}. Exp C needs the Binance trade history at "
+            f"{Path(symbol_dir).parent}/symbol=BTCUSDT|ETHUSDT|SOLUSDT/... Build it first with "
+            "`python procure_binance_data.py` (see docs/RUNBOOK_TEAMMATE.md, section 1).")
     all_second_dfs, ticks_so_far = [], 0
     for f in files:
         pf = pq.ParquetFile(f)
@@ -431,43 +490,39 @@ def engineer_features_for_symbol(symbol_dir: Path, max_ticks: int):
         ticks_so_far += len(file_sec)
         if ticks_so_far >= max_ticks: break
 
-    if not all_second_dfs: return None
-    combined = pd.concat(all_second_dfs).groupby(level=0).agg(_AGG_OPS).sort_index().reset_index(drop=True)
-    combined["mid_price"]    = combined["mid_sum"]  / combined["mid_count"].clip(lower=1)
-    combined["vwap"]         = combined["total_pq"] / combined["total_qty"].clip(lower=1e-8)
-    combined["log_return"]   = np.log(combined["mid_price"] / combined["mid_price"].shift(1).bfill())
-    combined["realized_vol"] = combined["log_return"].rolling(20, min_periods=1).std().fillna(0)
-    combined["buy_pressure"] = combined["buy_vol"] / (combined["buy_vol"] + combined["sell_vol"]).clip(lower=1e-8)
-    combined["vwap_spread"]  = (combined["vwap"] - combined["mid_price"]).abs() / combined["mid_price"].clip(lower=1e-8)
-    feats = combined[["log_return", "ofi", "realized_vol", "buy_pressure", "trade_count", "vwap_spread"]].values.astype(np.float32)
-    return feats[:max_ticks]
+    if not all_second_dfs:
+        raise ValueError(f"Parquet files under {symbol_dir} contained no usable trade rows.")
+    return pd.concat(all_second_dfs).groupby(level=0).agg(_AGG_OPS).sort_index()
 
 
-def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS):
-    log.section("Loading & Engineering 3-Asset Binance Trade Streams")
+def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS, price_mode="mean"):
+    from binance_align import align_on_grid, frame_to_features, forward_labels, gap_fraction, assert_no_long_outage
+    log.section("Loading & Engineering 3-Asset Binance Trade Streams (common 1 s clock)")
     syms = ["symbol=BTCUSDT", "symbol=ETHUSDT", "symbol=SOLUSDT"]
-    all_feats = []
+    raw = []
     for s in syms:
-        s_dir = DATA_DIR / s
         name = s.replace("symbol=", "")
         log.info(f"Streaming parquet chunks for {name}...")
-        f = engineer_features_for_symbol(s_dir, max_ticks)
-        all_feats.append(f)
-        log.info(f"  {name}: {len(f):,} 1s bins")
+        f = engineer_features_for_symbol(DATA_DIR / s, max_ticks)
+        raw.append(f)
+        log.info(f"  {name}: {len(f):,} non-empty seconds  [{f.index.min()} .. {f.index.max()}]")
 
-    min_len = min(len(f) for f in all_feats)
-    all_feats = [f[:min_len] for f in all_feats]
-    combined_feats = np.concatenate(all_feats, axis=1) # [min_len, 18]
+    log.info(f"Price series: {price_mode} trade price per second")
+    aligned, grid = align_on_grid(raw, price_mode=price_mode)
+    gf = gap_fraction(aligned)
+    log.metric("Seconds inside a >300 s outage of any asset", gf * 100, unit="%")
+    assert_no_long_outage(aligned, grid)     # fail closed on ANY flagged outage (not a dataset-wide percentage)
+    all_feats = [frame_to_features(g) for g in aligned]
+    for s, g in zip(syms, aligned):
+        log.metric(f"{s.split('=')[1]} stale-second %", float(g["stale"].mean() * 100), unit="%")
+    n_len = len(grid)
+    combined_feats = np.concatenate(all_feats, axis=1)        # [n_len, 18]
 
-    # Primary predictive label: 5s forward return of BTCUSDT (3 classes)
-    mid_returns = all_feats[0][:, 0]
-    fut = np.convolve(mid_returns, np.ones(HORIZON) / HORIZON, mode="full")[HORIZON - 1:][:min_len]
-    shifted = np.concatenate([fut[HORIZON:], np.repeat(fut[-1], HORIZON)])
-    alpha_down = np.percentile(shifted, 33.33)
-    alpha_up   = np.percentile(shifted, 66.67)
-    labels = np.ones(min_len, dtype=np.int64)
-    labels[shifted > alpha_up] = 2
-    labels[shifted < alpha_down] = 0
+    # Primary label: mean BTC log-return over the NEXT HORIZON seconds, thresholds from the train span.
+    train_end_row = split_plan(n_len)["label_support_end"]     # only returns a train label actually reads
+    labels, (lo, hi) = forward_labels(all_feats[0][:, 0], HORIZON, train_end_row)
+    labels[labels < 0] = 1                                    # padded tail is never used (purged below)
+    log.info(f"Label thresholds (train-only): down < {lo:.3e}, up > {hi:.3e}")
 
     # 2σ realized-volatility regime mask on BTC
     import pandas as pd
@@ -476,32 +531,44 @@ def build_binance_multi_asset_data(log: ExperimentLogger, max_ticks=SAMPLE_TICKS
     sg = s.rolling(REGIME_WINDOW, min_periods=1).std().fillna(0)
     regime = ((s > mu + REGIME_SIGMA * sg)).astype(np.float32).values
 
-    log.metric("Total 1s bins", min_len)
+    log.metric("Total 1s bins", n_len)
     log.metric("Features", combined_feats.shape[1])
     log.metric("Regime %", float(regime.mean() * 100), unit="%")
     return combined_feats, labels, regime
 
 
-def delta_encode(x, alpha=1.5):
-    d = torch.zeros_like(x)
-    d[:, 1:] = x[:, 1:] - x[:, :-1]
-    threshold = d.abs().mean(dim=(0, 1), keepdim=True) * alpha
-    return torch.cat([(d > threshold).float(), (d < -threshold).float()], dim=-1)
+def split_plan(n_len: int) -> dict:
+    """
+    Single source of truth for the chronological crypto split (review 4, item 1).
+    Window i reads input rows [i, i+SEQ_LEN) and its label reads returns on rows (t, t+HORIZON] with
+    t = i+SEQ_LEN-1.  Window boundaries purge HORIZON windows so label support never crosses a split.
+      scaler_end         exclusive row bound for feature scaling: only rows READ AS INPUT by a train window.
+      label_support_end  exclusive row bound for label thresholds: only returns used by a train label.
+    Validation/test windows may READ earlier rows as input context (causal history); that shared input
+    history is not target leakage and is not counted as such.
+    """
+    n_total = n_len - SEQ_LEN - HORIZON
+    n_train = int(n_total * TRAIN_FRAC); n_val = int(n_total * VAL_FRAC)
+    n = n_len - SEQ_LEN - HORIZON + 1
+    tr_end, va_end = n_train, n_train + n_val
+    tr_hi, va_hi = tr_end - HORIZON, va_end - HORIZON
+    return dict(n=n, tr_end=tr_end, va_end=va_end, tr_hi=tr_hi, va_hi=va_hi,
+                scaler_end=tr_hi - 1 + SEQ_LEN,
+                label_support_end=(tr_hi - 1) + SEQ_LEN - 1 + HORIZON + 1)
 
 
 def make_windows_binance(feats, labels, regime):
-    n_total = len(feats) - SEQ_LEN - HORIZON
-    n_train = int(n_total * TRAIN_FRAC)
-    n_val   = int(n_total * VAL_FRAC)
+    sp = split_plan(len(feats))
+    n, tr_end, va_end, tr_hi, va_hi = sp["n"], sp["tr_end"], sp["va_end"], sp["tr_hi"], sp["va_hi"]
 
-    train_feats = feats[:n_train + SEQ_LEN]
+    train_feats = feats[:sp["scaler_end"]]          # inputs of train windows only (never a validation-only row)
     mu = train_feats.mean(0, keepdims=True)
     sd = train_feats.std(0, keepdims=True) + 1e-8
     x_norm = (feats - mu) / sd
 
-    Xt = torch.from_numpy(x_norm)
-    yt = torch.from_numpy(labels)
-    rt = torch.from_numpy(regime)
+    Xt = torch.from_numpy(np.array(x_norm, copy=True))
+    yt = torch.from_numpy(np.array(labels, copy=True))
+    rt = torch.from_numpy(np.array(regime, copy=True))
     dt = torch.ones(len(feats), dtype=torch.float32) * 1.0 # 1s regular bins
 
     Xw = Xt.unfold(0, SEQ_LEN, 1).transpose(1, 2)
@@ -509,12 +576,9 @@ def make_windows_binance(feats, labels, regime):
     rw = rt.unfold(0, SEQ_LEN, 1).max(dim=1)[0]
     yw = yt[SEQ_LEN - 1:]
 
-    n = len(feats) - SEQ_LEN
-    tr_end = n_train
-    va_end = n_train + n_val
-
-    return (Xw[:tr_end], yw[:tr_end], rw[:tr_end], dt_w[:tr_end],
-            Xw[tr_end:va_end], yw[tr_end:va_end], rw[tr_end:va_end], dt_w[tr_end:va_end],
+    # keep every window whose label is real; HORIZON windows are purged before each split boundary.
+    return (Xw[:tr_hi], yw[:tr_hi], rw[:tr_hi], dt_w[:tr_hi],
+            Xw[tr_end:va_hi], yw[tr_end:va_hi], rw[tr_end:va_hi], dt_w[tr_end:va_hi],
             Xw[va_end:n], yw[va_end:n], rw[va_end:n], dt_w[va_end:n])
 
 
@@ -530,7 +594,7 @@ def macro_f1(pred, true, n=3):
 
 
 # ── training stages ───────────────────────────────────────────────────────────
-def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_A, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
+def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_A, ckpt_path=None, batch_size=BATCH_SIZE):
     log.section(f"Stage A — SNN Gate Cheap Head ({epochs} epochs)")
     params = [p for n, p in model.named_parameters() if n.startswith("gate.") and "gate_head" not in n]
     opt = torch.optim.Adam(params, lr=LR)
@@ -539,15 +603,17 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
     cw = (cw / cw.sum() * 3.0).to(device)
     ce = nn.CrossEntropyLoss(weight=cw)
 
+    ckpt_path = CKPT_PATH if ckpt_path is None else ckpt_path   # resolved at CALL time (monkeypatch/out_dir safe)
     ckpt = load_checkpoint(ckpt_path, log)
     start_ep = ckpt["epoch"] if ckpt and ckpt.get("stage") == "A" else 0
     best = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "A" else -1.0
     snap = ckpt.get("best_state") if ckpt and ckpt.get("stage") == "A" else None
     if ckpt and ckpt.get("stage") == "A":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
 
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
     for ep in range(start_ep, epochs):
         model.train()
         perm = torch.randperm(len(Xtr))
@@ -556,12 +622,15 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             b = perm[i:i + batch_size]
             Xb = Xtr[b].to(device).contiguous()
             dt_b = dt_tr[b].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             yb = ytr[b].to(device).contiguous()
             
             cheap, _, rate, _ = model.gate(Sb, dt_b)
             loss = ce(cheap, yb) + 1e-4 * rate
-            opt.zero_grad(); loss.backward(); opt.step()
+            guard.step(loss, params, opt)
+            if guard.halt:
+                log.warn(f"Stage A: {guard.consecutive} consecutive non-finite updates; halting."); break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
 
         model.eval()
@@ -570,7 +639,7 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             for i in range(0, len(Xva), batch_size):
                 Xb = Xva[i:i+batch_size].to(device).contiguous()
                 dt_b = dt_va[i:i+batch_size].to(device).contiguous()
-                c, _, _, _ = model.gate(delta_encode(Xb), dt_b)
+                c, _, _, _ = model.gate(model.encode(Xb), dt_b)
                 preds.append(c.argmax(1).cpu())
         f1 = macro_f1(torch.cat(preds), yva.cpu())
         if f1 > best:
@@ -583,12 +652,12 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             eta = (time.time() - t0) / (ep - start_ep + 1) * (epochs - ep - 1)
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, eta_s=eta)
 
-    if snap is not None: model.load_state_dict(snap)
+    if snap is not None: load_state_compat(model, snap)
     return model
 
 
-def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage B — Heavy Path (Magnetic Graph Laplacian + EWS) ({epochs} epochs)")
+def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=None, batch_size=BATCH_SIZE):
+    log.section(f"Stage B — Heavy Path (Magnetic Graph Laplacian + concurrent-regime ω alignment) ({epochs} epochs)")
     params_heavy = list(model.amp.parameters()) + list(model.ham.parameters()) + list(model.head.parameters())
     opt_heavy = torch.optim.Adam(params_heavy, lr=LR)
     
@@ -597,14 +666,16 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
     cw = (cw / cw.sum() * 3.0).to(device)
     ce = nn.CrossEntropyLoss(weight=cw)
 
+    ckpt_path = CKPT_PATH if ckpt_path is None else ckpt_path   # resolved at CALL time (monkeypatch/out_dir safe)
     ckpt = load_checkpoint(ckpt_path, log)
     start_ep = ckpt["epoch"] if ckpt and ckpt.get("stage") == "B" else 0
     best = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "B" else -1.0
     snap = ckpt.get("best_state") if ckpt and ckpt.get("stage") == "B" else None
     if ckpt and ckpt.get("stage") == "B":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
 
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
     for ep in range(start_ep, epochs):
         model.train()
         perm = torch.randperm(len(Xtr))
@@ -623,7 +694,10 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             loss_head = ce(heavy, yb)
             loss = loss_phys + loss_head
             
-            opt_heavy.zero_grad(); loss.backward(); opt_heavy.step()
+            guard.step(loss, params_heavy, opt_heavy)
+            if guard.halt:
+                log.warn(f"Stage B: {guard.consecutive} consecutive non-finite updates; halting."); break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
 
         model.eval()
@@ -644,35 +718,39 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             eta = (time.time() - t0) / (ep - start_ep + 1) * (epochs - ep - 1)
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, eta_s=eta)
 
-    if snap is not None: model.load_state_dict(snap)
+    if snap is not None: load_state_compat(model, snap)
     return model
 
 
-def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage C — Multi-Asset Gate Arbitration ({epochs} epochs)")
-    params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_gate, model.log_var_regime]
+def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=None, batch_size=BATCH_SIZE, gate_objective="legacy"):
+    log.section(f"Stage C — Multi-Asset Gate Arbitration ({epochs} epochs, objective={gate_objective})")
+    gate_params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_regime]
+    params = stage_c_mode(model, gate_params)   # Task 03
+    model.heavy_frozen = True
     opt = torch.optim.Adam(params, lr=5e-3)
     ce  = nn.CrossEntropyLoss()
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
 
+    ckpt_path = CKPT_PATH if ckpt_path is None else ckpt_path   # resolved at CALL time (monkeypatch/out_dir safe)
     ckpt = load_checkpoint(ckpt_path, log)
     start_ep = ckpt["epoch"] if ckpt and ckpt.get("stage") == "C" else 0
     best_score = ckpt.get("best_f1", -1e9) if ckpt and ckpt.get("stage") == "C" else -1e9
     snap = ckpt.get("best_state") if ckpt and ckpt.get("stage") == "C" else None
     if ckpt and ckpt.get("stage") == "C":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
 
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
     for ep in range(start_ep, epochs):
-        model.train()
+        model.eval()   # Task 03: no sampling noise
         perm = torch.randperm(len(Xtr))
         ep_loss = 0.0
         for i in range(0, len(Xtr), batch_size):
             b = perm[i:i + batch_size]
             Xb = Xtr[b].to(device).contiguous()
             dt_b = dt_tr[b].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             yb = ytr[b].to(device).contiguous()
             rb = rtr[b].to(device).contiguous()
             
@@ -680,6 +758,11 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             loss_ce = ce(logits, yb)
             loss_gate = g.mean()
             loss_regime = bce(gl * 4.0, rb)
+            if gate_objective == "benefit":
+                with torch.no_grad():
+                    cheap_l = model.gate(Sb, dt_b)[0]
+                    heavy_l = model.heavy_infer(Xb)
+                loss_regime = benefit_gate_loss(gl, expert_benefit(cheap_l, heavy_l, yb))
             
             log_ce = torch.clamp(model.log_var_ce, min=-5.0, max=10.0)
             log_regime = torch.clamp(model.log_var_regime, min=-5.0, max=10.0)
@@ -687,21 +770,24 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             adaptive_regime = loss_regime * torch.exp(-log_regime) + log_regime
             
             loss_gate_target = torch.relu(loss_gate - 0.10) * 5.0 + 0.2 * loss_gate
-            loss = adaptive_ce + adaptive_regime + loss_gate_target
-            opt.zero_grad(); loss.backward(); opt.step()
+            loss = (loss_regime + loss_gate_target) if gate_objective == "benefit" else (adaptive_ce + adaptive_regime + loss_gate_target)
+            guard.step(loss, params, opt)
+            if guard.halt:
+                log.warn(f"Stage C: {guard.consecutive} consecutive non-finite updates; halting."); break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
 
         model.eval()
-        preds, gates = [], []
+        preds, meter = [], RateMeter()
         with torch.no_grad():
             for i in range(0, len(Xva), batch_size):
                 Xb = Xva[i:i+batch_size].to(device).contiguous()
                 dt_b = dt_va[i:i+batch_size].to(device).contiguous()
-                lo, g, _, _, _, _, _, _, _, _, _ = model(delta_encode(Xb), Xb, dt_b)
+                lo, g, _, _, _, _, _, _, _, _, _ = model(model.encode(Xb), Xb, dt_b)
                 preds.append(lo.argmax(1).cpu())
-                gates.append(g.mean().cpu())
+                meter.update(g)
         f1 = macro_f1(torch.cat(preds), yva.cpu())
-        gate_rate = torch.tensor(gates).mean().item()
+        gate_rate = meter.rate
         score = f1 - (max(0.0, gate_rate - 0.12) * 5.0 + gate_rate * 0.1)
 
         if score > best_score:
@@ -715,13 +801,14 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             eta = (time.time() - t0) / (ep - start_ep + 1) * (epochs - ep - 1)
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, extra={"gate": gate_rate}, eta_s=eta)
 
-    if snap is not None: model.load_state_dict(snap)
+    if snap is not None: load_state_compat(model, snap)
     return model
 
 
 def evaluate_binance(model, X, y, r, dt_w, mode="learned", batch_size=1024):
     model.eval()
-    preds, gates, rates, pdes, omegas = [], [], [], [], []
+    preds, rates, pdes, omegas = [], [], [], []
+    meter = RateMeter()
     H_herm_max = 0.0
     A_sym_accum, Phi_accum = [], []
     device = next(model.parameters()).device
@@ -729,10 +816,10 @@ def evaluate_binance(model, X, y, r, dt_w, mode="learned", batch_size=1024):
         for i in range(0, len(X), batch_size):
             Xb = X[i:i+batch_size].to(device).contiguous()
             dt_b = dt_w[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             logits, g, rate, L_pde, H, S, _, _, _, A_sym, Phi_anti = model(Sb, Xb, dt_b, mode)
             preds.append(logits.argmax(1).cpu())
-            gates.append(g.mean().cpu())
+            meter.update(g)
             rates.append(rate.cpu())
             pdes.append(L_pde.cpu())
             omegas.append(torch.linalg.eigvalsh(S)[:, -1].cpu())
@@ -751,7 +838,7 @@ def evaluate_binance(model, X, y, r, dt_w, mode="learned", batch_size=1024):
     return dict(
         acc      = (pred == y.cpu()).float().mean().item(),
         f1       = macro_f1(pred, y.cpu()),
-        gate     = torch.tensor(gates).mean().item(),
+        gate     = meter.rate,
         spike    = torch.tensor(rates).mean().item(),
         pde      = torch.tensor(pdes).mean().item(),
         herm     = H_herm_max,
@@ -803,12 +890,16 @@ def train_lstm(Xtr, ytr, Xva, yva, device, epochs=15):
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
-def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE):
-    torch.manual_seed(SEED); np.random.seed(SEED)
+def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMPLE_TICKS, batch_size=BATCH_SIZE, gate_objective="legacy", out_dir=None, seed=None, price_mode="mean"):
+    global OUT_DIR, CKPT_PATH
+    seed = SEED if seed is None else int(seed)
+    if out_dir is not None:                       # smoke/trial runs must never touch the real output folder
+        OUT_DIR = Path(out_dir); OUT_DIR.mkdir(parents=True, exist_ok=True); CKPT_PATH = OUT_DIR / "checkpoint.pt"
+    torch.manual_seed(seed); np.random.seed(seed)
     log = ExperimentLogger(OUT_DIR / "train.log", experiment_name="Exp C — 3-Asset Binance Basket")
     device = get_device(verbose=True)
 
-    feats, labels, regime = build_binance_multi_asset_data(log, max_ticks=max_ticks)
+    feats, labels, regime = build_binance_multi_asset_data(log, max_ticks=max_ticks, price_mode=price_mode)
     log.section("Partitioning Trailing Windows")
     Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, Xte, yte, rte, dt_te = make_windows_binance(feats, labels, regime)
 
@@ -819,7 +910,16 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     log.metric("Test windows",  len(Xte))
     log.metric("Majority baseline", majority)
 
+    # Checkpoints resume ONLY for this exact configuration + data (review: smoke/test checkpoints must never leak in).
+    set_run_fingerprint(fingerprint_of(exp="C", n_rows=int(len(feats)), n_feat=int(feats.shape[1]),
+                                       head=float(np.round(np.asarray(feats[:2000], dtype=np.float64).sum(), 6)),
+                                       tail=float(np.round(np.asarray(feats[-2000:], dtype=np.float64).sum(), 6)),
+                                       seq=SEQ_LEN, horizon=HORIZON, tf=TRAIN_FRAC, vf=VAL_FRAC, seed=seed,
+                                       epochs=[epochs_a, epochs_b, epochs_c], max_ticks=max_ticks,
+                                       batch=batch_size, gate=gate_objective, price=price_mode))
     model = MultiAssetQSPINN(n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS).to(device)
+    # Task 04: encoder thresholds from TRAIN rows only (windows have stride 1 -> rebuild the row series)
+    model.encoder.fit(torch.cat([Xtr[:, 0], Xtr[-1, 1:]]).numpy())
     ckpt = load_checkpoint(CKPT_PATH, log)
     current_stage = ckpt["stage"] if ckpt else None
 
@@ -827,13 +927,16 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
         model = stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log, epochs=epochs_a, batch_size=batch_size)
     if current_stage != "C":
         model = stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log, epochs=epochs_b, batch_size=batch_size)
-    model = stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log, epochs=epochs_c, batch_size=batch_size)
+    model = stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log, epochs=epochs_c, batch_size=batch_size, gate_objective=gate_objective)
 
     log.section("Multi-Asset Ablation Suite")
     ablation_rows = []
 
-    lstm_epochs = 1 if epochs_a <= 2 else 15
-    lstm = train_lstm(Xtr, ytr, Xva, yva, device, epochs=lstm_epochs)
+    # Equal-budget baseline (same loop/optimiser/early stopping; epochs = hybrid's total stage epochs)
+    from baselines import train_classifier as _tc
+    lstm_epochs = epochs_a + epochs_b + epochs_c
+    lstm = _tc(LSTMBaseline(), Xtr, ytr, Xva, yva, device, macro_f1, epochs=lstm_epochs)
+    lstm.eval()
     lstm_preds = []
     with torch.no_grad():
         for i in range(0, len(Xte), 1024):
@@ -841,6 +944,11 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
             lstm_preds.append(lstm(Xb).argmax(1).cpu())
     p = torch.cat(lstm_preds)
     ablation_rows.append(("LSTM baseline", (p == yte.cpu()).float().mean().item(), macro_f1(p, yte.cpu()), float('nan'), float('nan'), float('nan'), float('nan')))
+
+    from baselines import past_return_lookup
+    nb_acc, nb_f1, nb_table = past_return_lookup(Xtr, ytr, Xte, yte, k=5, ret_idx=0)
+    log.info(f"Past-return lookup (microstructure baseline) bin->class table: {nb_table}")
+    ablation_rows.append(("Past-return lookup (naive)", nb_acc, nb_f1, float('nan'), float('nan'), float('nan'), float('nan')))
 
     m_cheap = evaluate_binance(model, Xte, yte, rte, dt_te, mode="cheap")
     ablation_rows.append(("SNN only (cheap)", m_cheap["acc"], m_cheap["f1"], 0.0, m_cheap["herm"], m_cheap["omega"], m_cheap["crash_P"]))
@@ -852,7 +960,7 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     ablation_rows.append(("Q-SPINN Multi-Asset Hybrid", m["acc"], m["f1"], m["gate"], m["herm"], m["omega"], m["crash_P"]))
 
     log.table(
-        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "Crash P"],
+        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "w>0 rate"],
         rows=[
             (name, f"{acc:.3f}", f"{f1:.3f}",
              "n/a" if gate != gate else f"{gate:.3f}",
@@ -865,10 +973,12 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
     )
 
     # Lead-lag analysis
-    log.section("Magnetic Graph Lead-Lag Latency Analysis")
+    log.section("Magnetic Graph phase matrix (diagnostic; gauge-dependent)")
     phi = m["Phi_anti"]
     btc_eth_lead = phi[0, 1]
     btc_sol_lead = phi[0, 2]
+    loop_flux = float(phi[0, 1] + phi[1, 2] + phi[2, 0])    # gauge-invariant cycle flux
+    log.info(f"Loop flux BTC->ETH->SOL->BTC (gauge-invariant): {loop_flux:+.4f} rad")
     log.info(f"Learned Phase Flux BTC -> ETH: {btc_eth_lead:+.4f} rad")
     log.info(f"Learned Phase Flux BTC -> SOL: {btc_sol_lead:+.4f} rad")
 
@@ -881,20 +991,25 @@ def main(epochs_a=EPOCHS_A, epochs_b=EPOCHS_B, epochs_c=EPOCHS_C, max_ticks=SAMP
 **Date:** {datetime.now().isoformat()}  
 **Assets:** BTCUSDT, ETHUSDT, SOLUSDT (18 features total)  
 **Prediction Horizon:** 5 seconds  
+**Clock:** common 1 s grid (v3.1 protocol)  
 
 ## Ablation Results
 
-| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\\omega(A_t)$ (EWS Margin) | Crash Prob |
+| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\\omega(A_t)$ (latent-flow diagnostic) | ω>0 rate (unvalidated) |
 |---|---|---|---|---|---|---|
 {rows_md}| **Majority baseline** | **{majority:.3f}** | — | — | — | — | — |
 
-## Magnetic Graph Laplacian & Lead-Lag Phase Analysis
+## Magnetic Graph Laplacian - antisymmetric phase matrix (diagnostic only)
 
-The directed phase flux matrix $\\Phi_{{ij}}$ captures empirical lead-lag latency:
-- **BTC $\\to$ ETH Phase Flux:** `{btc_eth_lead:+.4f}` rad
-- **BTC $\\to$ SOL Phase Flux:** `{btc_sol_lead:+.4f}` rad
+The learned antisymmetric phase matrix $\\Phi_{{ij}}$ is **gauge-dependent**: individual edge phases can be
+shifted by a node gauge transform without changing the physics. Only gauge-invariant loop quantities
+are meaningful, and even those are *not* evidence of causal lead-lag between assets.
+- BTC-ETH edge phase (gauge-dependent, do not interpret): `{btc_eth_lead:+.4f}` rad
+- BTC-SOL edge phase (gauge-dependent, do not interpret): `{btc_sol_lead:+.4f}` rad
+- BTC-ETH-SOL loop flux (gauge-invariant): `{loop_flux:+.4f}` rad
 
-A positive phase indicates that BTC microstructure features lead altcoin quote adjustments, confirming Objective O2.
+No lead-lag claim is made from these numbers. A lead-lag statement requires an out-of-sample predictive
+increment over directional temporal baselines (see docs/RUNBOOK_TEAMMATE.md, item 20).
 """
     (OUT_DIR / "RESULTS.md").write_text(md, encoding="utf-8")
     if CKPT_PATH.exists(): CKPT_PATH.unlink()
@@ -905,6 +1020,7 @@ A positive phase indicates that BTC microstructure features lead altcoin quote a
         "gate": m["gate"],
         "btc_eth_lead": float(btc_eth_lead),
         "btc_sol_lead": float(btc_sol_lead),
+        "loop_flux": loop_flux,
         "weights": str(OUT_DIR / "qspinn_binance_multi_asset.pt")
     }
     log.done(summary=summary)

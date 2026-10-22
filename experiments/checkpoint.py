@@ -18,8 +18,25 @@ Checkpoint format (a plain dict, stored as a .pt file):
   }
 """
 
+import hashlib
+import json
 from pathlib import Path
 import torch
+from qspinn_core import PROTOCOL_VERSION
+
+
+_FINGERPRINT = "unset"
+
+
+def fingerprint_of(**fields) -> str:
+    """Stable short hash of everything that defines a run: data summary, split, horizon, seed, epochs, objective..."""
+    return hashlib.sha256(json.dumps(fields, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def set_run_fingerprint(fp: str) -> None:
+    """Drivers call this once the run configuration + data are known.  Checkpoints are only resumed on an exact match."""
+    global _FINGERPRINT
+    _FINGERPRINT = fp
 
 
 def save_checkpoint(ckpt: dict, path: Path, log=None) -> None:
@@ -29,6 +46,7 @@ def save_checkpoint(ckpt: dict, path: Path, log=None) -> None:
     Writes to a .tmp file first, then renames it, so a crash mid-write
     never produces a half-written (corrupted) checkpoint.
     """
+    ckpt = dict(ckpt, protocol=PROTOCOL_VERSION, fingerprint=_FINGERPRINT)
     tmp = path.with_suffix(".tmp")
     torch.save(ckpt, tmp)
     tmp.replace(path)          # atomic on all major OS
@@ -55,6 +73,17 @@ def load_checkpoint(path: Path, log=None) -> dict | None:
         if missing:
             raise KeyError(f"Checkpoint missing keys: {missing}")
 
+        if ckpt.get("protocol") != PROTOCOL_VERSION:
+            msg = (f"Checkpoint '{path.name}' has protocol {ckpt.get('protocol')!r} != {PROTOCOL_VERSION!r}; "
+                   "ignoring it and starting fresh (never load legacy tensors into the new architecture).")
+            (log.warn(msg) if log else print(f"\n⚠  {msg}\n"))
+            return None
+        if ckpt.get("fingerprint") != _FINGERPRINT:
+            msg = (f"Checkpoint '{path.name}' was written by a different run configuration/data "
+                   f"(fingerprint {ckpt.get('fingerprint')!r} != {_FINGERPRINT!r}); ignoring it and starting fresh. "
+                   "(Typical cause: a smoke test, another seed/horizon/epoch budget, or different data.)")
+            (log.warn(msg) if log else print(f"\n⚠  {msg}\n"))
+            return None
         if log:
             log.info(f"Resuming from checkpoint: epoch {ckpt['epoch']}, stage {ckpt['stage']}")
         return ckpt

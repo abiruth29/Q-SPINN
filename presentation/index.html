@@ -103,7 +103,7 @@
 
           <div style="width: 100%; max-width: 400px; margin: 1.5rem auto 0;">
             <div style="display: flex; gap: 0.5rem; align-items: stretch; justify-content: center; height: clamp(24px, 4vw, 36px);">
-              <div style="flex: 1; border: var(--sketch-border-light); background: var(--canvas-warm); display: flex; align-items: center; justify-content: center; font-size: 0.85rem; color: var(--ink-light); font-family: var(--font-mono); border-radius: 2px;">~99% noise</div>
+              <div style="flex: 1; border: var(--sketch-border-light); background: var(--canvas-warm); display: flex; align-items: center; justify-content: center; font-size: 0.85rem; color: var(--ink-light); font-family: var(--font-mono); border-radius: 2px;">routine ticks</div>
               <div style="width: 40px; border: 1.5px solid var(--amber); display: flex; align-items: center; justify-content: center; font-size: 0.85rem; font-weight: 700; color: var(--amber); font-family: var(--font-mono); border-radius: 2px;">1%</div>
             </div>
             <div class="hand-note" style="color: var(--amber); margin-top: 0.8rem;">
@@ -206,7 +206,7 @@
           <img src="assets/research-gap.svg" class="icon-svg" alt="Broken bridge">
           <span class="sketch-label" style="color:var(--red);font-size:1.1rem;">Gap 2: Brute-Force DNNs</span>
           <p class="small" style="margin-top:0.5rem;color:var(--ink-mid);">
-            Deep learning processes every tick identically — wasting 99% of compute on noise. No mechanism to distinguish signal from noise. Overfits to regime-specific patterns.
+            Deep learning processes every tick identically — spending full compute on every tick, including uninformative ones. No mechanism to distinguish signal from noise. Overfits to regime-specific patterns.
           </p>
         </div>
 
@@ -358,11 +358,11 @@
           <div style="display:flex;flex-direction:column;gap:0.5rem;align-items:stretch;">
             <div class="pipeline-stage dormant" style="border-color:var(--ink-faint);padding:0.6rem 1rem;">
               <div class="sketch-label muted" style="font-size:0.85rem;">No Spike → Sleep</div>
-              <span class="small muted">~99% ticks</span>
+              <span class="small muted">routine updates</span>
             </div>
             <div class="pipeline-stage active-stage" style="border-color:var(--blue);padding:0.6rem 1rem;">
               <div class="sketch-label" style="font-size:0.85rem;color:var(--blue);">Spike! → Wake</div>
-              <span class="small muted">~1% ticks</span>
+              <span class="small muted">informative updates</span>
             </div>
           </div>
           <div class="pipeline-arrow">→</div>
@@ -494,7 +494,7 @@
 
         <!-- Target metrics -->
         <div class="col gap-md">
-          <h3>Target Metrics</h3>
+          <h3>Targets (not measured results)</h3>
           <div class="col gap-sm" style="margin-top:0.2rem;">
             <div class="load-bar-container">
               <span class="small" style="min-width:140px;color:var(--ink);">FLOP Reduction</span>
@@ -517,7 +517,7 @@
               <span class="load-bar-label">>80%</span>
             </div>
           </div>
-          <p class="small muted" style="margin-top:0.5rem;">All metrics evaluated via walk-forward cross-validation on unseen time periods.</p>
+          <p class="small muted" style="margin-top:0.5rem;">These are design targets only. They will be reported only after the controlled studies (fresh weights, paired segment-aware uncertainty, measured end-to-end latency) have been run.</p>
         </div>
       </div>
     </div>
@@ -535,7 +535,7 @@
         <div class="sketch-card" style="padding:1.5rem;text-align:center;">
           <img src="assets/industry-hft.svg" class="icon-svg icon-bob" alt="Candlestick chart">
           <span class="sketch-label" style="color:var(--blue);">HFT Firms</span>
-          <p class="small muted" style="margin-top:0.5rem;">Event-driven architectures that skip noise ticks directly reduce latency and hardware costs in production trading systems.</p>
+          <p class="small muted" style="margin-top:0.5rem;">Event-driven architectures that skip low-value ticks could reduce latency and hardware cost; this is a hypothesis to be tested by measured end-to-end latency, not a demonstrated result.</p>
         </div>
         <div class="sketch-card" style="padding:1.5rem;text-align:center;">
           <img src="assets/industry-risk.svg" class="icon-svg icon-pulse" alt="Shield with network">

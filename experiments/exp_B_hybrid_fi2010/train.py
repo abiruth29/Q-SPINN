@@ -20,9 +20,9 @@ SWAP STATUS
 -----------
 SWAP-01: ✅ Real FI-2010 LOB data (NoAuction Z-score)
 SWAP-02: ✅ Pre-normalized by FI-2010 authors (no leakage)
-SWAP-03: ✅ Adaptive batch-volatility threshold for delta-encoding
-SWAP-04: ✅ Learnable slope parameter (alpha) for arctan surrogate gradient
-SWAP-05: ✅ Highly optimized custom LIF layer with dynamic beta/alpha
+SWAP-03: ✅ Train-only per-feature delta thresholds (v3.1: SpikeEncoder, no batch dependence)
+SWAP-04: ✅ Arctan surrogate gradient with a FIXED slope (a hyperparameter; the slope is not trained)
+SWAP-05: ✅ Custom LIF layer (learned membrane time constant, fixed surrogate slope)
 SWAP-08: ✅ Kendall et al. homoscedastic adaptive loss weighting
 SWAP-15: ✅ Statistically validated 2σ realized-volatility regime proxy mask
 """
@@ -35,7 +35,6 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
-import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 
@@ -45,7 +44,10 @@ sys.path.insert(0, str(ROOT / "experiments"))
 
 from device import get_device
 from logger import ExperimentLogger
-from checkpoint import save_checkpoint, load_checkpoint, guard_nan
+from checkpoint import save_checkpoint, load_checkpoint, guard_nan, fingerprint_of, set_run_fingerprint
+from qspinn_core import (propagate, scale_anchor, bound_fro, hermitian_from_raw, symmetric_from_raw, GENERATOR_VERSION,
+                         StepGuard, SpikeEncoder, route_exact, RateMeter, load_state_compat,
+                         stage_c_mode, heavy_teacher_ctx, expert_benefit, benefit_gate_loss)
 
 # GPU Optimizations
 if torch.cuda.is_available():
@@ -74,6 +76,16 @@ LR            = 2e-3
 SEED          = 0
 LABEL_COL     = "label_k10"
 CKPT_PATH     = OUT_DIR / "checkpoint.pt"
+# Task 02: covariance (Van Loan + cov_head) is OFF until a defensible innovation
+# likelihood exists.  Set QSPINN_USE_COV=1 to re-enable for experimentation only.
+import os
+USE_COVARIANCE = os.environ.get("QSPINN_USE_COV", "0") == "1"
+# v3.1 generator settings (Tasks 08-10)
+LAMBDA_SCALE = float(os.environ.get("QSPINN_LAMBDA_SCALE", "1.0"))   # weight of the scale anchor (0 disables = ablation)
+RESIDUAL_MODE = os.environ.get("QSPINN_RESIDUAL", "last")   # 'last' (causal) | 'all' (legacy ablation)
+H_FRO_MAX = 2.0     # spectral control on H
+S_FRO_MAX = 1.0     # spectral control on S (growth per step <= e^1)
+MAX_GRAD_NORM = 1.0          # Task 01
 
 
 # ── surrogate gradient ────────────────────────────────────────────────────────
@@ -95,7 +107,7 @@ class IrregularLIFLayer(nn.Module):
         super().__init__()
         self.fc = nn.Linear(n_in, n_out)
         self.tau_m = nn.Parameter(torch.tensor(tau_m))
-        self.alpha = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha", torch.tensor(2.0))   # FIXED surrogate slope (hyperparameter, not trained)
 
     def forward(self, x_seq, dt_seq):
         import torch.nn.functional as F
@@ -142,7 +154,8 @@ class ComplexAmplitudeLayer(nn.Module):
         return psi / n.to(psi.dtype)
 
     def forward(self, x):
-        return self.normalise(torch.complex(self.to_real(x), self.to_imag(x)))
+        # v3.1 (Task 09): dynamical state stays UNNORMALISED; readout normalises a copy.
+        return torch.complex(self.to_real(x), self.to_imag(x))
 
     @staticmethod
     def density_features(psi):
@@ -162,16 +175,17 @@ class HamiltonianNet(nn.Module):
         self.n_assets = n_assets
         
         # Output: mu (2 * d * d per asset) + Graph Adjacency A (N*N) + Graph Flux Phi (N*N)
-        out_dim = (n_assets * 2 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
+        out_dim = (n_assets * 3 * d * d) + (n_assets * n_assets) + (n_assets * n_assets)
         self.net = nn.Sequential(nn.Linear(n_in, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, out_dim))
         
-        # Ornstein-Uhlenbeck / Kalman Filter stochastic parameters
+        # Exponential-smoothing recursion on the generator coefficients (Kalman-*style* gain, NOT a state-space
+        # filter: the coefficients are network outputs, not a hidden state with a validated observation model).
         self.theta = nn.Parameter(torch.full((n_assets,), 0.1))
         self.log_Q = nn.Parameter(torch.full((n_assets,), -3.0))
         self.log_R = nn.Parameter(torch.full((n_assets,), -2.0))
         self.scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, velocities):
+    def forward(self, velocities, with_prefix=False):
         B, seq_len, _ = velocities.shape
         import torch.nn.functional as F
         
@@ -186,14 +200,16 @@ class HamiltonianNet(nn.Module):
             v_t = velocities[:, t, :]
             out = self.net(v_t)
             
-            mu_raw = out[:, :self.n_assets * 2 * self.d * self.d]
-            mu_t  = mu_raw.view(B, self.n_assets, 2, self.d, self.d)
+            mu_raw = out[:, :self.n_assets * 3 * self.d * self.d]
+            mu_t  = mu_raw.view(B, self.n_assets, 3, self.d, self.d)
             
-            if t == seq_len - 1:
-                idx_A = self.n_assets * 2 * self.d * self.d
+            if t >= seq_len - 2:          # last two steps: keep graph heads for the prefix and full generators
+                idx_A = self.n_assets * 3 * self.d * self.d
                 idx_Phi = idx_A + self.n_assets * self.n_assets
-                A_raw   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
-                Phi_raw = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
+                A_t   = out[:, idx_A : idx_Phi].view(B, self.n_assets, self.n_assets)
+                Phi_t = out[:, idx_Phi : ].view(B, self.n_assets, self.n_assets)
+                if t == seq_len - 2: A_pre, Phi_pre = A_t, Phi_t
+                if t == seq_len - 1: A_raw, Phi_raw = A_t, Phi_t
             
             if z_t is None:
                 z_t = mu_t
@@ -204,7 +220,20 @@ class HamiltonianNet(nn.Module):
                 K_t = P_pred / (P_pred + R)
                 z_t = z_pred + K_t * (mu_t - z_pred)
                 P_t = (1 - K_t) * P_pred
+            if t == seq_len - 2:          # filtered state using observations up to (and incl.) step T-2 only
+                z_pre, P_pre = z_t, P_t
         
+        full = self._assemble(z_t, P_t, A_raw, Phi_raw, B, velocities.device)
+        if not with_prefix:
+            return full
+        if seq_len >= 2:
+            return full, self._assemble(z_pre, P_pre, A_pre, Phi_pre, B, velocities.device)
+        zero = tuple(torch.zeros_like(t_) if torch.is_tensor(t_) else t_ for t_ in full)
+        return full, zero      # 1 velocity step: no causal prefix -> identity residual generator
+
+
+    def _assemble(self, z_t, P_t, A_raw, Phi_raw, B, device):
+        import torch.nn.functional as F
         if self.training:
             epsilon = torch.randn_like(z_t)
             std = torch.sqrt(P_t + 1e-6)
@@ -212,13 +241,11 @@ class HamiltonianNet(nn.Module):
         else:
             z_final = z_t
             
-        A_local = torch.complex(z_final[:, :, 0], z_final[:, :, 1])
-        H_local = 0.5 * (A_local + A_local.conj().transpose(-1, -2))
-        
-        # S_local: symmetric component for local non-Hermitian expansion/contraction (Eq 27.2)
-        R_local = z_final[:, :, 0]
-        S_local = 0.5 * (R_local + R_local.transpose(-1, -2))
-        
+        # v3.1 (Task 08): S and H are INDEPENDENT.  channel 0 -> S (real symmetric, gain/loss),
+        # channels 1,2 -> Re/Im of H (Hermitian, conservative).  Previously S was Re(H).
+        S_local = symmetric_from_raw(z_final[:, :, 0])
+        H_local = hermitian_from_raw(z_final[:, :, 1], z_final[:, :, 2])
+
         if self.n_assets == 1:
             H_tot = H_local[:, 0]
             S_tot = S_local[:, 0]
@@ -233,9 +260,9 @@ class HamiltonianNet(nn.Module):
             L = torch.complex(D, torch.zeros_like(D)) - W
             
             # Kronecker coupling: H_tot = BlockDiag(H_k) + L (x) I_d
-            H_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.complex64, device=velocities.device)
-            S_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.float32, device=velocities.device)
-            I_d = torch.eye(self.d, dtype=torch.complex64, device=velocities.device)
+            H_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.complex64, device=device)
+            S_tot = torch.zeros(B, self.n_assets * self.d, self.n_assets * self.d, dtype=torch.float32, device=device)
+            I_d = torch.eye(self.d, dtype=torch.complex64, device=device)
             
             for i in range(self.n_assets):
                 for j in range(self.n_assets):
@@ -247,7 +274,7 @@ class HamiltonianNet(nn.Module):
                     else:
                         H_tot[:, si:ei, sj:ej] = L[:, i, j].view(B, 1, 1) * I_d
                         
-        return self.scale * H_tot, self.scale * S_tot
+        return (bound_fro(self.scale * H_tot, H_FRO_MAX), bound_fro(self.scale * S_tot, S_FRO_MAX))
 
 
 # ── Van Loan Exact Covariance Propagator ─────────────────────────────────────
@@ -298,7 +325,7 @@ class SNNGate(nn.Module):
         self.lif2       = IrregularLIFLayer(HIDDEN, HIDDEN)
         self.cheap_head = LeakyReadout(HIDDEN, 3)
         self.gate_head  = LeakyReadout(HIDDEN, 1)
-        self.alpha_gate = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer("alpha_gate", torch.tensor(2.0))   # FIXED surrogate slope
         nn.init.constant_(self.gate_head.fc.bias, 0.5)
 
     def forward(self, spikes, dt_seq):
@@ -314,8 +341,11 @@ class SNNGate(nn.Module):
 
 # ── full Q-SPINN ──────────────────────────────────────────────────────────────
 class QSPINN(nn.Module):
-    def __init__(self, n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS):
+    def __init__(self, n_in=N_FEATURES, d=PSI_DIM, n_assets=N_ASSETS, use_cov=None):
         super().__init__()
+        self.use_cov = USE_COVARIANCE if use_cov is None else use_cov
+        self.heavy_frozen = False      # Task 03: set by stage_c_mode
+        self.encoder = SpikeEncoder(n_in)   # Task 04: fitted on TRAIN only
         self.gate = SNNGate(n_in=n_in)
         self.amp  = ComplexAmplitudeLayer(n_in=n_in, d=d, n_assets=n_assets)
         self.ham  = HamiltonianNet(n_in=n_in, d=d, n_assets=n_assets)
@@ -333,14 +363,12 @@ class QSPINN(nn.Module):
         
         # SWAP-08: Adaptive loss weighting parameters
         self.log_var_ce     = nn.Parameter(torch.tensor(0.0))
-        self.log_var_gate   = nn.Parameter(torch.tensor(0.0))
         self.log_var_regime = nn.Parameter(torch.tensor(0.0))
 
     def heavy_path(self, x):
-        psi        = self.amp(x)
-        # Pass the entire sequence of velocities to the Kalman Filter
+        # Pass the whole velocity sequence through the coefficient-smoothing recursion (see HamiltonianNet note)
         velocities = x[:, 1:] - x[:, :-1]
-        H_tot, S_tot = self.ham(velocities)
+        (H_tot, S_tot), (H_res, S_res) = self.ham(velocities, with_prefix=True)   # prefix ends at T-2: causal residual
         
         B, N, _ = H_tot.shape
         
@@ -352,54 +380,32 @@ class QSPINN(nn.Module):
         A_R_mat = S_tot + H_I
         A_I_mat = -H_R
         
-        A_block = torch.zeros(B, 2 * N, 2 * N, device=x.device, dtype=torch.float32)
-        A_block[:, :N, :N] = A_R_mat
-        A_block[:, :N, N:] = -A_I_mat
-        A_block[:, N:, :N] = A_I_mat
-        A_block[:, N:, N:] = A_R_mat
-        
-        # Exact Van Loan Covariance Propagation (V3-02 & V3-03)
-        F, Q_h = self.van_loan(A_block, DT)
-        
-        # Continuous-Time Mean Integration via Matrix Exponential
-        U = torch.matrix_exp(-1j * H_tot * DT)
-        
-        # Propagate all states in the window exactly
-        psi_pred = torch.einsum('bij,btj->bti', U, psi[:, :-1])
-        L_pde    = (psi[:, 1:] - psi_pred).abs().pow(2).mean()
-        
-        # Covariance Residual Consistency Loss (V3-04)
-        z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
-        Sigma_theta_flat = self.cov_head(z_T)
-        Sigma_theta = Sigma_theta_flat.view(B, 2 * N, 2 * N)
-        Sigma_theta = Sigma_theta @ Sigma_theta.transpose(-1, -2) # PSD constraint
-        
-        # Discrete-time covariance residual
-        R_Sigma = F @ Sigma_theta @ F.transpose(-1, -2) + Q_h - Sigma_theta
-        L_cov = R_Sigma.abs().pow(2).mean()
-        # Norm-Balance Residual Loss (V3-05)
-        # Empirical finite-difference derivative of the squared norm
-        norm_sq_t1 = psi[:, 1:].abs().pow(2).sum(dim=-1)
-        norm_sq_t0 = psi[:, :-1].abs().pow(2).sum(dim=-1)
-        d_norm_sq_dt = (norm_sq_t1 - norm_sq_t0) / DT
-        
-        # Theoretical prediction: 2 * Psi^\dagger * S * Psi
-        # psi[:, :-1] has shape [B, T-1, N]
-        # S_tot has shape [B, N, N]
-        # B x T-1 x N
-        psi_t0 = psi[:, :-1]
-        psi_t0_conj = psi_t0.conj()
-        S_tot_complex = S_tot.to(torch.complex64)
-        
-        # 2 \Psi^\dagger S \Psi (real because S is symmetric)
-        # We can use einsum: bti, bij, btj -> bt
-        theoretical_expansion = 2 * torch.einsum('bti,bij,btj->bt', psi_t0_conj, S_tot_complex, psi_t0).real
-        
-        R_norm = d_norm_sq_dt - theoretical_expansion
-        L_norm = R_norm.abs().pow(2).mean()
-        
-        psi_T    = psi[:, -1]
-        psi_next = torch.einsum('bij,bj->bi', U, psi_T)
+        if self.use_cov:
+            A_block = torch.zeros(B, 2 * N, 2 * N, device=x.device, dtype=torch.float32)
+            A_block[:, :N, :N] = A_R_mat
+            A_block[:, :N, N:] = -A_I_mat
+            A_block[:, N:, :N] = A_I_mat
+            A_block[:, N:, N:] = A_R_mat
+            
+            F, Q_h = self.van_loan(A_block, DT)
+
+        # Task 09/10: ONE generator A = S - iH drives the means; residuals are causal ('last').
+        psi = self.amp(x)     # unnormalised dynamical state
+        U, L_pde, L_norm_ = propagate(psi, H_tot, S_tot, DT, RESIDUAL_MODE, H_res=H_res, S_res=S_res)
+
+        if self.use_cov:
+            z_T = torch.cat([psi[:, -1].real, psi[:, -1].imag], dim=-1)
+            Sigma_theta = self.cov_head(z_T).view(B, 2 * N, 2 * N)
+            Sigma_theta = Sigma_theta @ Sigma_theta.transpose(-1, -2)  # PSD
+            R_Sigma = F @ Sigma_theta @ F.transpose(-1, -2) + Q_h - Sigma_theta
+            L_cov = R_Sigma.abs().pow(2).mean()
+        else:
+            L_cov = torch.zeros((), device=x.device)
+
+        L_norm = L_norm_ + LAMBDA_SCALE * scale_anchor(psi)   # norm balance + window-level non-collapse anchor
+
+        psi_T    = ComplexAmplitudeLayer.normalise(psi[:, -1])
+        psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))
         feats    = torch.cat([
             ComplexAmplitudeLayer.density_features(psi_T),
             ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),
@@ -407,22 +413,63 @@ class QSPINN(nn.Module):
             
         return self.head(feats), L_pde, H_tot, S_tot, L_cov, L_norm
 
+    @torch.no_grad()
+    def heavy_infer(self, x, return_omega=False):
+        """Inference-only heavy expert: logits only - no residual generator, no PDE/norm/covariance work.
+        return_omega=True also returns omega = lambda_max(S) from the SAME full-window generator (no extra losses)."""
+        (H_tot, S_tot) = self.ham(x[:, 1:] - x[:, :-1])
+        psi = self.amp(x)
+        U = torch.matrix_exp((S_tot.to(torch.complex64) - 1j * H_tot) * DT)
+        psi_T = ComplexAmplitudeLayer.normalise(psi[:, -1])
+        psi_next = ComplexAmplitudeLayer.normalise(torch.einsum('bij,bj->bi', U, psi[:, -1]))
+        feats = torch.cat([ComplexAmplitudeLayer.density_features(psi_T),
+                           ComplexAmplitudeLayer.density_features(ComplexAmplitudeLayer.normalise(psi.mean(1))),
+                           ComplexAmplitudeLayer.density_features(psi_next)], dim=-1)
+        logits = self.head(feats)
+        if return_omega:
+            return logits, torch.linalg.eigvalsh(S_tot)[:, -1]
+        return logits
+
+    @torch.no_grad()
+    def infer(self, spikes, x, dt_seq, chunk=4096, sel=None):
+        """
+        Deployed conditional inference: gate first, heavy expert ONLY on selected rows, scatter back.
+        Returns (logits, selected_mask, heavy_rows).  Zero selected rows => zero heavy calls.
+        """
+        self.eval()
+        cheap, g, _, _ = self.gate(spikes, dt_seq)
+        sel = (g > 0.5) if sel is None else sel      # `sel` override is for latency sweeps at a fixed routing fraction
+        out = cheap.clone()
+        idx = torch.nonzero(sel, as_tuple=False).squeeze(1)
+        for i in range(0, len(idx), chunk):
+            j = idx[i:i + chunk]
+            out[j] = self.heavy_infer(x[j])
+        return out, sel, int(len(idx))
+
     def forward(self, spikes, x, dt_seq, mode="learned"):
         cheap, g, rate, gl = self.gate(spikes, dt_seq)
         if mode == "cheap":
             H0 = torch.zeros(1, PSI_DIM, PSI_DIM, dtype=torch.cfloat, device=spikes.device)
             S0 = torch.zeros(1, PSI_DIM, PSI_DIM, dtype=torch.float32, device=spikes.device)
             return cheap, torch.zeros_like(g), rate, torch.zeros((), device=spikes.device), H0, S0, gl, torch.zeros((), device=spikes.device), torch.zeros((), device=spikes.device)
-        heavy, L_pde, H, S, L_cov, L_norm = self.heavy_path(x)
+        if self.heavy_frozen:                      # Task 03: fixed teacher
+            with heavy_teacher_ctx():
+                heavy, L_pde, H, S, L_cov, L_norm = self.heavy_path(x)
+        else:
+            heavy, L_pde, H, S, L_cov, L_norm = self.heavy_path(x)
         if mode == "dense":
             return heavy, torch.ones_like(g), rate, L_pde, H, S, gl, L_cov, L_norm
-        gm = (torch.sigmoid(gl) * g).unsqueeze(-1)
-        return gm * heavy + (1 - gm) * cheap, g, rate, L_pde, H, S, gl, L_cov, L_norm
+        # Task 05: binary gate selects one expert's logits exactly (no attenuation)
+        return route_exact(cheap, heavy, g), g, rate, L_pde, H, S, gl, L_cov, L_norm
+
+    def encode(self, x):
+        return self.encoder(x)
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
 def load_fi2010(log: ExperimentLogger, label_col=LABEL_COL):
     log.section(f"Loading FI-2010 (NoAuction Z-Score, {label_col})")
+    import pyarrow.parquet as pq   # lazy: unit tests don't need pyarrow
     t0  = time.time()
     tbl = pq.read_table(ROOT / "data" / "reference" / "fi2010" / "fi2010_noauction_zscore.parquet")
     df  = tbl.to_pandas()
@@ -452,6 +499,21 @@ def load_fi2010(log: ExperimentLogger, label_col=LABEL_COL):
     return Xtr, ytr, Xva, yva, Xte, yte
 
 
+def load_fi2010_setup2(log: ExperimentLogger, label_col=LABEL_COL):
+    """Task 07: Setup 2 (train days 1-7, test days 8-10) with stock/day segment ids."""
+    from fi2010_setup2 import load_setup2
+    path = ROOT / "data" / "reference" / "fi2010" / "fi2010_setup2.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Build it first:  python procure_fi2010.py --setup2  "
+            "(then inspect segment_audit.json), or pass --legacy_split to reproduce the old protocol.")
+    log.section(f"Loading FI-2010 Setup 2 ({label_col})")
+    d = load_setup2(path, label_col)
+    for k in ("train", "val", "test"):
+        log.metric(f"{k} rows", len(d[k]["X"]))
+    return d
+
+
 def build_regime_mask(feats: np.ndarray) -> np.ndarray:
     """2σ realized-volatility proxy on the FI-2010 mid-price series."""
     import pandas as pd
@@ -465,29 +527,23 @@ def build_regime_mask(feats: np.ndarray) -> np.ndarray:
     return regime
 
 
-def delta_encode(x, alpha=1.5):
-    d        = torch.zeros_like(x)
-    d[:, 1:] = x[:, 1:] - x[:, :-1]
-    # Adaptive threshold based on batch mean absolute deviation
-    threshold = d.abs().mean(dim=(0, 1), keepdim=True) * alpha
-    return torch.cat([(d > threshold).float(), (d < -threshold).float()], dim=-1)
-
-
-def make_windows_from_array(X, y, regime):
-    """Zero-memory sliding windows on CPU using PyTorch unfold."""
+def make_windows_from_array(X, y, regime, seg_id=None, horizon=0):
+    """
+    Sliding windows on CPU.  Task 04/06: dt is the fixed event-index step (1.0),
+    not random noise; the last valid window is included (no off-by-one).
+    With `seg_id` (per-row stock/day id) windows never straddle segments and the
+    last `horizon` rows of a segment are purged (Task 07).
+    """
+    from qspinn_core import window_starts
     Xt = torch.from_numpy(X)
     yt = torch.from_numpy(y)
     rt = torch.from_numpy(regime)
-    dt = torch.empty(len(X), dtype=torch.float32).exponential_(10.0)
-    
-    # unfold(dim, size, step) creates a strided view without allocating memory
     Xw = Xt.unfold(0, SEQ_LEN, 1).transpose(1, 2)
-    dt_w = dt.unfold(0, SEQ_LEN, 1)
     rw = rt.unfold(0, SEQ_LEN, 1).max(dim=1)[0]
-    yw = yt[SEQ_LEN - 1:]
-    
-    n = len(X) - SEQ_LEN
-    return Xw[:n], yw[:n], rw[:n], dt_w[:n]
+    starts = torch.from_numpy(window_starts(len(X), SEQ_LEN, seg_id, horizon))
+    yw = yt[starts + SEQ_LEN - 1]
+    dt_w = torch.ones(1, SEQ_LEN).expand(len(starts), SEQ_LEN)
+    return Xw[starts], yw, rw[starts], dt_w
 
 
 # ── metrics ───────────────────────────────────────────────────────────────────
@@ -509,7 +565,7 @@ def eval_stage_A(model, Xva, yva, dt_va, device, batch_size=1024):
         for i in range(0, len(Xva), batch_size):
             Xb = Xva[i:i+batch_size].to(device).contiguous()
             dt_b = dt_va[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             c, _, _, _ = model.gate(Sb, dt_b)
             preds.append(c.argmax(1).cpu())
     return macro_f1(torch.cat(preds), yva.cpu())
@@ -530,9 +586,10 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
     best       = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "A" else -1.0
     snap       = ckpt.get("best_state")    if ckpt and ckpt.get("stage") == "A" else None
     if ckpt and ckpt.get("stage") == "A":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
 
     for ep in range(start_ep, epochs):
         model.train()
@@ -542,15 +599,16 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             b = perm[i:i + batch_size]
             Xb = Xtr[b].to(device).contiguous()
             dt_b = dt_tr[b].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             yb = ytr[b].to(device).contiguous()
             
             cheap, _, rate, _ = model.gate(Sb, dt_b)
             loss = ce(cheap, yb) + 1e-4 * rate
-            opt.zero_grad(); loss.backward(); opt.step()
-            
-            if guard_nan(loss, ep + 1, "A", log):
+            guard.step(loss, params, opt)
+            if guard.halt:
+                log.warn(f"Stage A: {guard.consecutive} consecutive non-finite updates skipped; halting.")
                 nan_hit = True; break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
             
         if nan_hit:
@@ -568,14 +626,14 @@ def stage_A(model, Xtr, ytr, dt_tr, Xva, yva, dt_va, device, log: ExperimentLogg
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, eta_s=eta)
 
     if snap is not None:
-        model.load_state_dict(snap)
+        load_state_compat(model, snap)
     
     # Final eval for metrics
     model.eval()
     with torch.no_grad():
         Xb = Xva[:1024].to(device).contiguous()
         dt_b = dt_va[:1024].to(device).contiguous()
-        _, _, r, _ = model.gate(delta_encode(Xb), dt_b)
+        _, _, r, _ = model.gate(model.encode(Xb), dt_b)
     log.stage("Stage A done", {"val_F1": eval_stage_A(model, Xva, yva, dt_va, device, batch_size=batch_size), "spike_rate": r.item()})
     return model
 
@@ -592,7 +650,7 @@ def eval_stage_B(model, Xva, yva, device, batch_size=1024):
 
 
 def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, epochs=EPOCHS_B, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage B — Heavy path (EM Cross-Fitted Training + EWS Regularization) ({epochs} epochs)")
+    log.section(f"Stage B — Heavy path (EM Cross-Fitted Training + concurrent-regime alignment of ω) ({epochs} epochs)")
     
     # Joint Optimization for Physics Generator + Classification Head
     params_heavy = list(model.amp.parameters()) + list(model.ham.parameters()) + list(model.head.parameters())
@@ -608,12 +666,13 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
     best       = ckpt.get("best_f1", -1.0) if ckpt and ckpt.get("stage") == "B" else -1.0
     snap       = ckpt.get("best_state")    if ckpt and ckpt.get("stage") == "B" else None
     if ckpt and ckpt.get("stage") == "B":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         try:
             opt_heavy.load_state_dict(ckpt["optimizer"]["heavy"])
         except:
             log.info("Could not load split optimizer state from legacy checkpoint. Starting fresh optimizers.")
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
 
     for ep in range(start_ep, epochs):
         model.train()
@@ -628,23 +687,24 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             # Joint PINN Forward Pass
             heavy, L_pde, H, S, L_cov, L_norm = model.heavy_path(Xb)
             
-            # EWS Numerical Abscissa Stability Loss (Eq 28.3)
-            # Contractive dynamics (omega <= -0.02) during normal regimes (rb == 0)
-            # Expansive dynamics (omega >= +0.02) during volatility shocks (rb == 1)
+            # Concurrent-regime alignment of ω (Eq 28.3).  The target `rb` is a TRAILING realised-volatility flag, i.e. already
+            # observed at the forecast origin: this teaches ω to describe the CURRENT regime. It is NOT forward-warning
+            # supervision, so ω is a current-regime / latent-flow diagnostic, not a predictor (review 4, item 2).
+            # Contractive dynamics (omega <= -0.02) when trailing volatility is normal (rb == 0)
+            # Expansive dynamics (omega >= +0.02) when trailing volatility is already elevated (rb == 1)
             omegas = torch.linalg.eigvalsh(S)[:, -1]
             loss_ews = (torch.relu(omegas + 0.02) * (1.0 - rb) + torch.relu(0.02 - omegas) * rb).mean()
             
-            # V3-04 & V3-05: Structural constraints + EWS + Classification Loss
+            # V3-04 & V3-05: Structural constraints + regime alignment + Classification Loss
             loss_phys = LAMBDA_PDE * L_pde + 0.1 * L_cov + 0.1 * L_norm + 0.1 * loss_ews
             loss_head = ce(heavy, yb)
             loss = loss_phys + loss_head
             
-            opt_heavy.zero_grad()
-            loss.backward()
-            opt_heavy.step()
-            
-            if guard_nan(loss, ep + 1, "B", log):
+            guard.step(loss, params_heavy, opt_heavy)
+            if guard.halt:
+                log.warn(f"Stage B: {guard.consecutive} consecutive non-finite updates skipped; halting.")
                 nan_hit = True; break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
             
         if nan_hit:
@@ -662,7 +722,7 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
             log.epoch(ep + 1, epochs, loss=ep_loss/len(Xtr), val_f1=f1, eta_s=eta)
 
     if snap is not None:
-        model.load_state_dict(snap)
+        load_state_compat(model, snap)
     
     # Final eval for metrics
     model.eval()
@@ -675,22 +735,24 @@ def stage_B(model, Xtr, ytr, rtr, Xva, yva, rva, device, log: ExperimentLogger, 
 
 def eval_stage_C(model, Xva, yva, dt_va, device, batch_size=1024):
     model.eval()
-    preds, gates = [], []
+    preds, meter = [], RateMeter()
     with torch.no_grad():
         for i in range(0, len(Xva), batch_size):
             Xb = Xva[i:i+batch_size].to(device).contiguous()
             dt_b = dt_va[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             lo, g, _, _, _, _, _, _, _ = model(Sb, Xb, dt_b)
             preds.append(lo.argmax(1).cpu())
-            gates.append(g.mean().cpu())
+            meter.update(g)
     f1 = macro_f1(torch.cat(preds), yva.cpu())
-    return f1, torch.tensor(gates).mean().item()
+    return f1, meter.rate
 
 
-def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE):
-    log.section(f"Stage C — Gate head arbitration  ({epochs} epochs)")
-    params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_gate, model.log_var_regime]
+def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: ExperimentLogger, epochs=EPOCHS_C, ckpt_path=CKPT_PATH, batch_size=BATCH_SIZE, gate_objective="legacy"):
+    log.section(f"Stage C — Gate head arbitration  ({epochs} epochs, objective={gate_objective})")
+    gate_params = list(model.gate.gate_head.parameters()) + [model.log_var_ce, model.log_var_regime]
+    params = stage_c_mode(model, gate_params)   # Task 03: heavy frozen + eval + no-grad teacher
+    model.heavy_frozen = True
     opt  = torch.optim.Adam(params, lr=5e-3)
     ce   = nn.CrossEntropyLoss()
     pos_weight = torch.tensor([15.0]).to(device)
@@ -701,19 +763,20 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
     best_score = ckpt.get("best_f1", -1e9) if ckpt and ckpt.get("stage") == "C" else -1e9
     snap       = ckpt.get("best_state")    if ckpt and ckpt.get("stage") == "C" else {k: v.clone() for k, v in model.state_dict().items()}
     if ckpt and ckpt.get("stage") == "C":
-        model.load_state_dict(ckpt["model"])
+        load_state_compat(model, ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
     t0 = time.time()
+    guard = StepGuard(MAX_GRAD_NORM)
 
     for ep in range(start_ep, epochs):
-        model.train()
+        model.eval()   # Task 03: no HamiltonianNet sampling noise in Stage C
         perm = torch.randperm(len(Xtr))
         ep_loss, nan_hit = 0.0, False
         for i in range(0, len(Xtr), batch_size):
             b = perm[i:i + batch_size]
             Xb = Xtr[b].to(device).contiguous()
             dt_b = dt_tr[b].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             yb = ytr[b].to(device).contiguous()
             rb = rtr[b].to(device).contiguous()
             
@@ -721,6 +784,12 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             loss_ce = ce(logits, yb)
             loss_gate = g.mean()
             loss_regime = bce(gl * 4.0, rb)
+            if gate_objective == "benefit":
+                # Route by predictive BENEFIT of the heavy expert (frozen teacher), not by trailing volatility.
+                with torch.no_grad():
+                    cheap_l = model.gate(Sb, dt_b)[0]
+                    heavy_l = model.heavy_infer(Xb)
+                loss_regime = benefit_gate_loss(gl, expert_benefit(cheap_l, heavy_l, yb))
             
             # SWAP-08: Adaptive Loss Weighting (Kendall et al. 2018)
             log_ce = torch.clamp(model.log_var_ce, min=-5.0, max=10.0)
@@ -731,11 +800,12 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
             
             # Sparsity enforcement: penalize gate rates over 10%
             loss_gate_target = torch.relu(loss_gate - 0.10) * 5.0 + 0.2 * loss_gate
-            loss = adaptive_ce + adaptive_regime + loss_gate_target
-            opt.zero_grad(); loss.backward(); opt.step()
-            
-            if guard_nan(loss, ep + 1, "C", log):
+            loss = (loss_regime + loss_gate_target) if gate_objective == "benefit" else (adaptive_ce + adaptive_regime + loss_gate_target)
+            guard.step(loss, params, opt)
+            if guard.halt:
+                log.warn(f"Stage C: {guard.consecutive} consecutive non-finite updates skipped; halting.")
                 nan_hit = True; break
+            if not torch.isfinite(loss): continue
             ep_loss += loss.item() * len(b)
         if nan_hit:
             break
@@ -757,13 +827,14 @@ def stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log: Expe
                       val_f1=f1, extra={"gate": gate_rate}, eta_s=eta)
 
     if snap is not None:
-        model.load_state_dict(snap)
+        load_state_compat(model, snap)
     return model
 
 
-def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
+def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024, return_pred=False):
     model.eval()
-    preds, gates, rates, pdes, omegas = [], [], [], [], []
+    preds, rates, pdes, omegas = [], [], [], []
+    meter = RateMeter()
     H_herm_max = 0.0
     device = next(model.parameters()).device
     
@@ -771,14 +842,14 @@ def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
         for i in range(0, len(X), batch_size):
             Xb = X[i:i+batch_size].to(device).contiguous()
             dt_b = dt_w[i:i+batch_size].to(device).contiguous()
-            Sb = delta_encode(Xb)
+            Sb = model.encode(Xb)
             logits, g, rate, L_pde, H, S, _, _, _ = model(Sb, Xb, dt_b, mode)
             preds.append(logits.argmax(1).cpu())
-            gates.append(g.mean().cpu())
+            meter.update(g)
             rates.append(rate.cpu())
             pdes.append(L_pde.cpu())
             
-            # EWS Metric: Numerical Abscissa (omega) is max eigenvalue of Symmetric matrix S
+            # Diagnostic: Numerical Abscissa (omega) is max eigenvalue of Symmetric matrix S
             batch_omegas = torch.linalg.eigvalsh(S)[:, -1]
             omegas.append(batch_omegas.cpu())
             
@@ -786,12 +857,14 @@ def evaluate(model, X, y, r, dt_w, mode="learned", batch_size=1024):
             if herm > H_herm_max: H_herm_max = herm
             
     pred = torch.cat(preds)
+    if return_pred:
+        return pred
     omega_all = torch.cat(omegas)
     
     return dict(
         acc      = (pred == y.cpu()).float().mean().item(),
         f1       = macro_f1(pred, y.cpu()),
-        gate     = torch.tensor(gates).mean().item(),
+        gate     = meter.rate,
         spike    = torch.tensor(rates).mean().item(),
         pde      = torch.tensor(pdes).mean().item(),
         herm     = H_herm_max,
@@ -864,19 +937,19 @@ def write_results(ablation_rows, m_full, timestamp, device_name, majority, out_p
 
 | Property | Value |
 |---|---|
-| Source | FI-2010 NoAuction Z-Score (`data/reference/fi2010/fi2010_noauction_zscore.parquet`) |
+| Source | FI-2010 NoAuction Z-Score, **Setup 2** (`data/reference/fi2010/fi2010_setup2.parquet`; train days 1-7, test days 8-10; windows never cross stock/day segments) |
 | Features | 144 (10 LOB levels × 4 quantities × 1 stock, + 4 derived) |
 | Label | `label_k{horizon}` (3-class mid-price direction, {horizon}-tick horizon) |
 | Seed | {seed} |
-| Train | Folds 1–7 |
-| Val | Fold 8 |
-| Test | Fold 9 |
+| Train | Setup 2 days 1-6 |
+| Val | Setup 2 day 7 |
+| Test | Setup 2 days 8, 9, 10 |
 | Normalization | Pre-normalized by FI-2010 authors (Z-score, no leakage) |
 | Regime proxy | realized_vol > μ + {REGIME_SIGMA}σ (rolling {REGIME_WINDOW}-tick window) |
 
 ## Ablation Results
 
-| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\omega(A_t)$ (EWS Margin) | Crash Prob ($\omega>0$) |
+| Model | Accuracy | Macro-F1 | Gate Rate | Hermiticity ‖H−H†‖ | $\omega(A_t)$ (latent-flow diagnostic) | $\omega>0$ rate (unvalidated, not a crash probability) |
 |---|---|---|---|---|---|---|
 {rows_md}| **Majority baseline** | **{majority:.3f}** | — | — | — | — | — |
 
@@ -885,14 +958,17 @@ def write_results(ablation_rows, m_full, timestamp, device_name, majority, out_p
 Three-stage training was used:
 
 1. **Stage A ({ep_a} epochs):** SNN gate cheap head only (heavy path frozen)
-2. **Stage B ({ep_b} epochs):** Heavy path only + EWS regularization (SNN frozen)
+2. **Stage B ({ep_b} epochs):** Heavy path only + concurrent-regime alignment of ω (SNN frozen)
 3. **Stage C ({ep_c} epochs):** Gate head only with sparsity calibration (everything else frozen)
 
-## Key Findings
+## Notes on interpretation
 
-- The Hermiticity check `‖H − H†‖` is exactly 0.00e+00 by construction.
-- Gate selectivity triggers on true regime shifts while keeping heavy compute sparse (~5-10%).
-- Early Warning System: $\omega(A_t) \le 0$ during stable markets, transitioning to $\omega > 0$ during volatility bursts.
+- `‖H − H†‖` is zero because H is *constructed* Hermitian; it checks the code path, it is not an empirical result.
+- The gate rate is the **global** share of test windows routed to the heavy expert. It is a budget statistic, not a
+  compute saving: measured latency is reported separately by `routing_study.py`.
+- $\omega(A_t)=\lambda_{{\max}}(S)$ is a latent-flow diagnostic. Whether it forecasts instability is decided only by
+  `early_warning_study.py` against a rolling-volatility baseline.
+- Nothing in this file is a claim about trading performance.
 """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(md, encoding="utf-8")
@@ -911,10 +987,16 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
     parser.add_argument("--out_dir", type=str, default="", help="Custom output directory")
     parser.add_argument("--run_name", type=str, default="", help="Run tag for logs")
+    parser.add_argument("--baseline_epochs", type=int, default=0,
+                        help="epochs for LSTM/DeepLOB (0 = epochs_a+epochs_b+epochs_c, i.e. equal to the hybrid's budget)")
+    parser.add_argument("--gate_objective", default="legacy", choices=["legacy", "benefit"],
+                        help="Stage C gate target: legacy (CE+trailing-vol BCE) or benefit (heavy-vs-cheap predictive benefit)")
+    parser.add_argument("--legacy_split", action="store_true",
+                        help="Old concatenated-fold protocol (NOT Setup 2); results must be labelled legacy")
     return parser.parse_args()
 
 
-def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name=""):
+def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, batch_size=None, out_dir=None, run_name="", legacy_split=False, baseline_epochs=None, gate_objective=None):
     if horizon is None and __name__ == "__main__" and len(sys.argv) > 1:
         args = parse_args()
         horizon = args.horizon
@@ -925,7 +1007,11 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         batch_size = args.batch_size
         out_dir = Path(args.out_dir) if args.out_dir else OUT_DIR
         run_name = args.run_name
+        legacy_split = args.legacy_split
+        baseline_epochs = args.baseline_epochs
+        gate_objective = args.gate_objective
     else:
+        gate_objective = gate_objective or "legacy"
         horizon = 10 if horizon is None else horizon
         seed = 0 if seed is None else seed
         epochs_a = EPOCHS_A if epochs_a is None else epochs_a
@@ -933,6 +1019,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         epochs_c = EPOCHS_C if epochs_c is None else epochs_c
         batch_size = BATCH_SIZE if batch_size is None else batch_size
         out_dir = Path(out_dir) if out_dir else OUT_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
         run_name = run_name or f"k{horizon}_s{seed}"
 
     torch.manual_seed(seed); np.random.seed(seed)
@@ -943,22 +1030,33 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
                            experiment_name=f"Exp B — FI-2010 (k={horizon}, seed={seed})")
     device = get_device(verbose=True)
 
-    # Load data for the requested horizon
-    Xtr_np, ytr_np, Xva_np, yva_np, Xte_np, yte_np = load_fi2010(log, label_col=label_col)
+    # Load data for the requested horizon (Task 07: Setup 2 with provenance by default)
+    if legacy_split:
+        log.warn("LEGACY concatenated-fold split - results are NOT Setup 2 and must be labelled legacy.")
+        Xtr_np, ytr_np, Xva_np, yva_np, Xte_np, yte_np = load_fi2010(log, label_col=label_col)
+        segs = dict(train=None, val=None, test=None)
+    else:
+        d = load_fi2010_setup2(log, label_col=label_col)
+        Xtr_np, ytr_np = d["train"]["X"], d["train"]["y"]
+        Xva_np, yva_np = d["val"]["X"],   d["val"]["y"]
+        Xte_np, yte_np = d["test"]["X"],  d["test"]["y"]
+        segs = {k: d[k]["seg"] for k in ("train", "val", "test")}
 
-    # Build regime masks
     log.section("Building 2σ regime masks")
-    rtr_np = build_regime_mask(Xtr_np)
-    rva_np = build_regime_mask(Xva_np)
-    rte_np = build_regime_mask(Xte_np)
+    if legacy_split:
+        rtr_np, rva_np, rte_np = (build_regime_mask(a) for a in (Xtr_np, Xva_np, Xte_np))
+    else:   # per-segment so volatility statistics never leak across stock/day joins
+        from fi2010_setup2 import segmented_regime_mask
+        rtr_np, rva_np, rte_np = (segmented_regime_mask(Xs, segs[k], REGIME_WINDOW, REGIME_SIGMA)
+                                  for Xs, k in ((Xtr_np, "train"), (Xva_np, "val"), (Xte_np, "test")))
     log.metric("Train regime %", rtr_np.mean() * 100, unit="%")
     log.metric("Val regime %",   rva_np.mean() * 100, unit="%")
     log.metric("Test regime %",  rte_np.mean() * 100, unit="%")
 
-    log.section("Building sequence windows (SEQ_LEN=20)")
-    Xtr, ytr, rtr, dt_tr = make_windows_from_array(Xtr_np, ytr_np, rtr_np)
-    Xva, yva, rva, dt_va = make_windows_from_array(Xva_np, yva_np, rva_np)
-    Xte, yte, rte, dt_te = make_windows_from_array(Xte_np, yte_np, rte_np)
+    log.section("Building sequence windows (SEQ_LEN=20, per stock-day segment)")
+    Xtr, ytr, rtr, dt_tr = make_windows_from_array(Xtr_np, ytr_np, rtr_np, segs["train"], horizon)
+    Xva, yva, rva, dt_va = make_windows_from_array(Xva_np, yva_np, rva_np, segs["val"],   horizon)
+    Xte, yte, rte, dt_te = make_windows_from_array(Xte_np, yte_np, rte_np, segs["test"],  horizon)
 
     mode_val = torch.mode(yte)[0].item()
     majority = (yte == mode_val).float().mean().item()
@@ -967,9 +1065,17 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     log.metric("Val windows",   len(Xva))
     log.metric("Test windows",  len(Xte))
     log.metric("Majority baseline", majority)
+    majority_f1 = macro_f1(torch.full_like(yte, mode_val), yte)   # Task 07: majority-class macro-F1
+    log.metric("Majority-class macro-F1", majority_f1)
 
     try:
         model = QSPINN().to(device)
+        vp = None if segs["train"] is None else (segs["train"][1:] == segs["train"][:-1])   # no stock/day-join deltas
+        model.encoder.fit(Xtr_np, valid_pair=vp)   # train-only thresholds, same encoder for val/test
+        set_run_fingerprint(fingerprint_of(exp="B", horizon=horizon, seed=seed, epochs=[epochs_a, epochs_b, epochs_c],
+                                           batch=batch_size, gate=gate_objective, legacy=bool(legacy_split),
+                                           n=[int(len(Xtr)), int(len(Xva)), int(len(Xte))],
+                                           head=float(np.round(float(Xtr[:200].double().sum()), 6))))
         ckpt = load_checkpoint(ckpt_path, log)
         current_stage = ckpt["stage"] if ckpt else None
         
@@ -982,7 +1088,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
                             epochs=epochs_b, ckpt_path=ckpt_path, batch_size=batch_size)
             
         model = stage_C(model, Xtr, ytr, rtr, dt_tr, Xva, yva, rva, dt_va, device, log,
-                        epochs=epochs_c, ckpt_path=ckpt_path, batch_size=batch_size)
+                        epochs=epochs_c, ckpt_path=ckpt_path, batch_size=batch_size, gate_objective=gate_objective)
     except Exception as e:
         log.warn(f"Training crashed: {type(e).__name__}: {e}")
         log.warn("Last checkpoint is intact — re-run to resume from the last completed epoch.")
@@ -992,8 +1098,12 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     log.section("Ablation suite")
     ablation_rows = []
 
-    lstm_epochs = 1 if epochs_a <= 2 else 20
-    lstm = train_lstm(Xtr, ytr, Xva, yva, device, epochs=lstm_epochs)
+    # Equal-budget baselines (review rank 17): same loop, optimiser, early-stopping rule, and an epoch budget equal
+    # to the hybrid's TOTAL stage epochs (no per-model tuning for ANY model - stated as a limitation in the paper).
+    from baselines import train_classifier as _tc
+    lstm_epochs = baseline_epochs if baseline_epochs else (epochs_a + epochs_b + epochs_c)
+    log.metric("Baseline epoch budget", lstm_epochs)
+    lstm = _tc(LSTMBaseline(), Xtr, ytr, Xva, yva, device, macro_f1, epochs=lstm_epochs, seed=seed)
     lstm.eval()
     lstm_preds = []
     with torch.no_grad():
@@ -1004,6 +1114,14 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     ablation_rows.append(("LSTM baseline", (p == yte.cpu()).float().mean().item(),
                            macro_f1(p, yte.cpu()), float('nan'), float('nan'), float('nan'), float('nan')))
 
+    # Task 15: DeepLOB re-implementation on the same windows/split/epoch budget as the LSTM baseline
+    from baselines import DeepLOB, train_classifier, predict, count_params
+    dl = train_classifier(DeepLOB(), Xtr, ytr, Xva, yva, device, macro_f1, epochs=lstm_epochs, seed=seed)
+    p_dl = predict(dl, Xte, device)
+    log.metric("DeepLOB params", count_params(dl))
+    ablation_rows.append(("DeepLOB (re-implemented, same split)", (p_dl == yte.cpu()).float().mean().item(),
+                           macro_f1(p_dl, yte.cpu()), float('nan'), float('nan'), float('nan'), float('nan')))
+
     m_cheap = evaluate(model, Xte, yte, rte, dt_te, mode="cheap")
     ablation_rows.append(("SNN only", m_cheap["acc"], m_cheap["f1"], 0.0, m_cheap["herm"], m_cheap["omega"], m_cheap["crash_P"]))
 
@@ -1013,8 +1131,20 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     m = evaluate(model, Xte, yte, rte, dt_te, mode="learned")
     ablation_rows.append(("Q-SPINN (full hybrid)", m["acc"], m["f1"], m["gate"], m["herm"], m["omega"], m["crash_P"]))
 
+    from stats import block_bootstrap_f1
+    ci = {}
+    if segs["test"] is None:
+        seg_w, blk = None, 200
+    else:     # blocks never straddle stock/day joins; block shrinks to fit the shortest segment
+        from qspinn_core import window_starts as _ws
+        seg_w = segs["test"][_ws(len(segs["test"]), SEQ_LEN, segs["test"], horizon) + SEQ_LEN - 1]
+        _c = np.bincount(seg_w - seg_w.min()); blk = int(max(1, min(200, _c[_c > 0].min())))
+    for tag, mode in (("hybrid", "learned"), ("cheap", "cheap"), ("dense", "dense")):
+        pr = evaluate(model, Xte, yte, rte, dt_te, mode=mode, return_pred=True)
+        ci[tag] = block_bootstrap_f1(pr.numpy(), yte.numpy(), n_boot=500, block=blk, seg=seg_w)
+        log.metric(f"macro-F1 95% CI ({tag})", f"{ci[tag][0]:.3f} [{ci[tag][1]:.3f}, {ci[tag][2]:.3f}]")
     log.table(
-        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "Crash P"],
+        headers=["Model", "Acc", "Macro-F1", "Gate", "||H-H†||", "ω(A_t)", "w>0 rate"],
         rows=[
             (name, f"{acc:.3f}", f"{f1:.3f}",
              "n/a" if gate != gate else f"{gate:.3f}",
@@ -1022,7 +1152,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
              "n/a" if omega != omega else f"{omega:.4f}",
              "n/a" if crash != crash else f"{crash*100:.1f}%")
             for name, acc, f1, gate, herm, omega, crash in ablation_rows
-        ] + [("Majority baseline", f"{majority:.3f}", "—", "—", "—", "—", "—")],
+        ] + [("Majority baseline", f"{majority:.3f}", f"{majority_f1:.3f}", "—", "—", "—", "—")],
         title=f"Ablation Results (k={horizon}, seed={seed})",
     )
 
@@ -1033,8 +1163,14 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     log.info(f"Model weights  → {weights_path}")
     
     # Also save to default path for standard single-asset compatibility
-    if horizon == 10 and seed == 0:
+    if horizon == 10 and seed == 0 and Path(out_dir) == OUT_DIR:     # canonical copies only for real (non-smoke) runs
         torch.save(model.state_dict(), OUT_DIR / "qspinn_fi2010.pt")
+    from live_contract import make_contract, save_contract   # Task 17: record the input contract
+    save_contract(out_dir / f"qspinn_fi2010_k{horizon}_s{seed}_contract.json",
+                  make_contract(SEQ_LEN, N_FEATURES, "fi2010_authors", "dataset_zscore", "equity"))
+    if horizon == 10 and seed == 0 and Path(out_dir) == OUT_DIR:     # canonical copies only for real (non-smoke) runs
+        save_contract(OUT_DIR / "qspinn_fi2010_contract.json",
+                      make_contract(SEQ_LEN, N_FEATURES, "fi2010_authors", "dataset_zscore", "equity"))
 
     timestamp = datetime.now().isoformat()
     gpu_name  = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -1043,7 +1179,7 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
     write_results(ablation_rows, m, timestamp, gpu_name, majority,
                   out_path=res_path, horizon=horizon, seed=seed,
                   epochs_tuple=(epochs_a, epochs_b, epochs_c))
-    if horizon == 10 and seed == 0:
+    if horizon == 10 and seed == 0 and Path(out_dir) == OUT_DIR:     # canonical copies only for real (non-smoke) runs
         write_results(ablation_rows, m, timestamp, gpu_name, majority,
                       out_path=OUT_DIR / "RESULTS.md", horizon=10, seed=0,
                       epochs_tuple=(epochs_a, epochs_b, epochs_c))
@@ -1063,6 +1199,11 @@ def main(horizon=None, seed=None, epochs_a=None, epochs_b=None, epochs_c=None, b
         "omega"              : full_m[5] if full_m[5] == full_m[5] else 0.0,
         "crash_p"            : full_m[6] if full_m[6] == full_m[6] else 0.0,
         "majority"           : majority,
+        "majority_macro_f1"  : majority_f1,
+        "baseline_epochs"    : lstm_epochs,
+        "f1_ci95"            : list(ci["hybrid"][1:]),
+        "f1_ci95_cheap"      : list(ci["cheap"][1:]),
+        "f1_ci95_dense"      : list(ci["dense"][1:]),
         "weights_path"       : str(weights_path),
         "results_path"       : str(res_path)
     }

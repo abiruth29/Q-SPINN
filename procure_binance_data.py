@@ -50,15 +50,15 @@ def init_dirs():
     CURATED_DIR.mkdir(parents=True, exist_ok=True)
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
     if not MANIFEST_FILE.exists():
-        with open(MANIFEST_FILE, "w") as f:
+        with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
             json.dump({"schema_version": 1, "partitions": []}, f)
 
 def load_manifest():
-    with open(MANIFEST_FILE, "r") as f:
+    with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_manifest(manifest):
-    with open(MANIFEST_FILE, "w") as f:
+    with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
 def is_verified(manifest, symbol, year, month):

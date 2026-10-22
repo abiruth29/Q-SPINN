@@ -1,3 +1,5 @@
+> **LEGACY RESULTS - NOT VALID UNDER THE v3.1 PROTOCOL.** Produced before the v3.1 corrections. Do not cite; regenerate with `docs/RUNBOOK_TEAMMATE.md`. Claims about DeepLOB gains, crash probability, compute savings or BTC lead-lag are retracted.
+
 # Q-SPINN — Master Publication Experimental Results
 
 **Last Updated:** 2026-10-20T11:48:52.723435  

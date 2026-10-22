@@ -1,109 +1,63 @@
-# ⚛️ Q-SPINN: Quantum-Inspired Spiking Physics-Informed Neural Network
+# Q-SPINN — Quantum-Inspired Spiking Physics-Informed Neural Network
 
-**A Real-Time Early Warning System (EWS) for Multi-Asset High-Frequency Trading.**
+**Research prototype** for compute-aware mid-price direction prediction on limit-order-book data:
+a cheap event-driven spiking (LIF) gate decides, per window, whether an expensive quantum-inspired
+"heavy" expert (generator A = S − iH, propagated with exp(AΔt)) is needed.
 
-Q-SPINN is an advanced hybrid deep learning architecture designed to predict structural phase transitions (flash crashes) in high-frequency Limit Order Book (LOB) data. It combines event-driven Spiking Neural Networks (SNNs) with continuous-time Quantum Physics-Informed Neural Networks (PINNs).
+> **Status (v3.1, branch `fix/v3.1-corrections`).** The code has been corrected after an independent audit
+> (see `docs/FIX_PLAN.md`). **All numbers from earlier versions are retracted** and live under
+> `experiments/**/RESULTS*.md` with a LEGACY banner. New results are produced by the runbook in
+> `docs/RUNBOOK_TEAMMATE.md`; until they exist, this repository makes **no** accuracy, compute-saving,
+> early-warning or lead-lag claim.
 
-## 📊 Live Dashboard Preview
-The project features a real-time Streamlit dashboard that tracks the **Numerical Abscissa $\omega(A_t)$**, a quantum phase-space divergence metric. When $\omega > 0$, the market is structurally diverging, acting as an Early Warning System for an imminent crash.
+## What the model is (and is not)
 
----
+| Component | What it does | What is *not* claimed |
+|---|---|---|
+| SNN gate (`SNNGate`) | cheap expert + routing decision from a delta-encoded spike train (train-only thresholds) | not shown to predict where the heavy expert helps — measured in the routing study |
+| Heavy expert (`heavy_path`) | complex amplitude ψ, one generator A = S − iH, exp(AΔt), density read-out | "quantum" means quantum-*inspired* linear algebra, not quantum computing |
+| Routing | binary, exact hand-over (g=1 → heavy logits, g=0 → cheap logits); budget chosen on validation | no compute saving is claimed until wall-clock latency is measured (`routing_study.py`) |
+| ω = λ_max(S) | latent-flow **diagnostic** (numerical abscissa of the symmetric part) | **not** a crash probability or validated early-warning signal |
+| Magnetic Laplacian (Exp C) | learned antisymmetric phase matrix; only the gauge-invariant loop flux is reported | **no** causal lead-lag claim between assets |
 
-## 🏗️ Core Architecture
+## Data protocols
 
-The system pipeline is entirely self-contained and heavily optimized for real-time inference:
+* **FI-2010 Setup 2** — the protocol is train days 1–7 / test days 8–10; this code trains on **days 1–6, validates on
+  day 7, tests on days 8–10**. Built by `python procure_fi2010.py --setup2 --segments segment_lengths.json`, which
+  requires *verified* per-stock/day row counts and refuses to guess boundaries. Windows never cross a segment and the
+  last `k` rows of each segment are purged. The old concatenated-fold protocol exists only as `--legacy_split`.
+* **Binance (Exp C)** — BTC/ETH/SOL trades aggregated to a *common* 1-second clock with stale-second flags;
+  label thresholds use only summaries lying entirely inside the training span; each asset is seeded from its own last pre-grid price (no backward fill) and long outages stop the run; `ofi` was renamed `signed_volume` (it is trade-signed
+  volume, not order-flow imbalance from depth).
 
-### 1. Data Ingestion (`ingestor.py` & `lob_extractor.py`)
-- **Live Streams**: Asynchronous `websockets` connection to Binance L2 Order Book (`@depth20@100ms`) and Trade (`@trade`) streams for `BTC`, `ETH`, and `SOL`.
-- **Real-Time LOB Extraction**: Uses a custom `FI2010Extractor` to reconstruct the exact 144-dimensional physics feature space natively from the WebSocket depth payload, performing dynamic online Z-Score normalization.
-- **Historical Backfill**: Local asynchronous ZIP downloader for monthly/daily historical Binance datasets.
+## Repository map
 
-### 2. Physics-Informed Engine (`experiments/exp_B_hybrid_fi2010/train.py`)
-- **Irregular Event Dynamics**: Features a bespoke `IrregularLIFLayer` with an exact surrogate gradient to track asynchronous $\Delta t_n$ between market ticks, utilizing continuous exponential membrane decay $\beta_n = e^{-\Delta t_n / \tau_m}$.
-- **Continuous-Discrete State-Space Estimation**: Exact continuous-to-discrete covariance propagation using the Van Loan block-exponential algorithm coupled with a latent Ornstein-Uhlenbeck (OU) stochastic forcing field.
-- **Non-Hermitian Gain-Loss Mechanics**: Empirically extracts the structural generator components (expansion/contraction vs circulation) using strict Norm-Balance ($\mathcal{L}_{norm}$) and Covariance-Residual ($\mathcal{L}_{\Sigma}$) consistency objectives.
-- **Magnetic Graph Laplacian**: Encodes lead-lag market micro-structures between BTC, ETH, and SOL using complex gauge-invariant Kronecker flux matrices.
+| Path | Purpose |
+|---|---|
+| `experiments/qspinn_core.py` | shared, unit-tested core (safe optimiser step, spike encoder, exact routing, generator, windowing) |
+| `experiments/exp_B_hybrid_fi2010/train.py` | FI-2010 training (three stages A/B/C); `routing_study.py`, `early_warning_study.py` run after it |
+| `experiments/exp_C_multi_asset_binance/train.py` | 3-asset crypto experiment |
+| `experiments/routing.py` | budgeted routing, conditional inference, early-warning metrics |
+| `experiments/live_contract.py`, `pipeline.py`, `dashboard.py` | live demo; refuses weights without a matching protocol/contract, and mismatched ones unless `--demo`; dashboard shows no data unless a feed exists (simulation only via `QSPINN_DASH_MOCK=1`, labelled) |
+| `experiments/legacy_v3.0/` | archived pre-v3.1 weights and run state — rejected by the code, never to be loaded |
+| `tests/` | synthetic-data unit tests for every correction (`pytest -q`, ~10 s, no data or GPU needed) |
+| `docs/FIX_PLAN.md`, `docs/RUNBOOK_TEAMMATE.md` | what changed, and exactly what to run to regenerate results |
 
-### 3. Real-Time Production Glue (`pipeline.py`)
-- The master script that boots the WebSocket, feeds throttled ticks into the PyTorch `QSPINN` model, evaluates the continuous-time Early Warning System metrics, and streams results to `live_inference.jsonl`.
+## Quick start
 
-### 4. EWS Dashboard (`dashboard.py`)
-- A reactive Streamlit interface continuously monitoring `live_inference.jsonl`.
-- Features an adjustable dynamic Critical Alert Threshold, a live continuous-time Probability Area chart, and live plots of the **Time-Integrated Numerical Abscissa** ($\Omega_T$) and the **Phase-Space Divergence** ($d_J$).
-
----
-
-## 🏆 Verified Empirical Benchmark Results
-
-### 1. Multi-Horizon Benchmark on Canonical FI-2010 (Section 25)
-Standard evaluation on the canonical FI-2010 benchmark (Folds 1–7 Train, Fold 8 Val, Fold 9 Test) across 2,045,191 order book events:
-
-| Prediction Horizon | Accuracy | **Macro-F1** | DeepLOB Baseline (Zhang et al.) | **F1 Gain vs. DeepLOB** | Gate Rate (Compute Load) | $\omega(A_t)$ (EWS Margin) | Crash Prob ($\omega > 0$) | Majority Baseline |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **$k=10$ ticks** | **80.4%** | **0.746** | ~0.570 | **+17.6%** | 10.0% | `-0.0062` | 19.3% | 0.642 |
-| **$k=20$ ticks** | **71.1%** | **0.679** | ~0.590 | **+8.9%** | 10.4% | `-0.0019` | 24.9% | 0.541 |
-| **$k=50$ ticks** | **79.7%** | **0.794** | ~0.610 | **+18.4%** | **5.3%** 🚀 | `-0.0125` | 14.4% | 0.374 |
-
-### 2. Multi-Seed Statistical Significance (SWAP-12, $k=10$)
-Validation across independent random weight initializations and batch permutations:
-
-| Run | Accuracy | Macro-F1 | Gate Rate | $\omega(A_t)$ | Crash Prob |
-| :---| :---: | :---: | :---: | :---: | :---: |
-| **Seed 0** | 0.8038 | 0.7457 | 0.0997 | -0.0062 | 19.3% |
-| **Seed 1** | 0.8017 | 0.7472 | 0.1024 | -0.0065 | 18.0% |
-| **Seed 2** | 0.7976 | 0.7416 | 0.1058 | -0.0077 | 18.4% |
-| **Seed 3** | 0.8047 | 0.7474 | 0.1028 | -0.0068 | 18.7% |
-| **Seed 4** | 0.8063 | 0.7517 | 0.1019 | -0.0067 | 20.3% |
-| **Mean $\pm$ Std ($N=5$)** | **$0.803 \pm 0.003$** | **$0.747 \pm 0.003$** | **$0.102 \pm 0.002$** | **$-0.0068 \pm 0.0005$** | **18.9%** |
-
-### 3. Multi-Asset Crypto Basket (Experiment C — BTC, ETH, SOL)
-Evaluating cross-asset Magnetic Graph Laplacian on 350,000 one-second cryptocurrency order book bins (5-second forward terciles):
-
-| Model | Accuracy | Macro-F1 | Gate Rate | $\omega(A_t)$ (EWS Margin) | Van Loan Hermiticity |
-| :---| :---: | :---: | :---: | :---: | :---: |
-| LSTM Baseline | 0.599 | 0.386 | n/a | n/a | n/a |
-| SNN Reflex Only (0% PINN) | 0.510 | 0.388 | 0.000 | 0.0000 | 0.00e+00 |
-| PINN Physics Only (100% Awake) | 0.586 | 0.401 | 1.000 | -0.0258 | 0.00e+00 |
-| **Q-SPINN Multi-Asset Hybrid** | **0.510** | **0.389** | **0.010** (1% wake!) | **-0.0258** | **0.00e+00** |
-
-**Empirical Directed Lead-Lag Discovery (Objective O2):**
-- **$\Phi_{\text{BTC}\to\text{SOL}} = +1.7378$ rad:** Confirms Bitcoin order flow dynamically leads Solana quote updates.
-- **$\Phi_{\text{BTC}\to\text{ETH}} = -0.3973$ rad:** Captures cross-exchange lead-lag latency.
-- **Compute Reduction:** Dynamic gating wakes the heavy matrix exponential path on only **1.0%** of samples, delivering a 99% compute reduction in production.
-
-*For complete mathematical proofs, symplectic derivations, and cross-asset formulation, see [Q_SPINN_COMPLETE_REFERENCE_DOCUMENT.md](./Q_SPINN_COMPLETE_REFERENCE_DOCUMENT.md).*
-
----
-
-## 🚀 Quick Start
-
-### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
+pytest -q                                   # must be green before any training run
+python procure_fi2010.py --setup2 --segments segment_lengths.json   # verified counts; see runbook §1
+python experiments/exp_B_hybrid_fi2010/train.py --horizon 10 --seed 0
+python experiments/exp_B_hybrid_fi2010/routing_study.py --horizon 10 --seed 0 --weights <weights.pt>
 ```
 
-### 2. Run the Real-Time Inference Pipeline
-```bash
-python pipeline.py
-```
-*Loads calibrated weights [`qspinn_fi2010.pt`](./experiments/exp_B_hybrid_fi2010/qspinn_fi2010.pt), streams live Binance order book depths, and logs continuous EWS risk metrics.*
+The long-form mathematical reference is `Q_SPINN_COMPLETE_REFERENCE_DOCUMENT.md`; it predates v3.1 and its
+result tables are superseded.
 
-### 3. Launch the Interactive Dashboard
-```bash
-streamlit run dashboard.py
-```
-Open `http://localhost:8501` to view live order flow probabilities, SNN gate spikes, and phase-space divergence $\omega(A_t)$.
-
-### 4. Run the Unattended Benchmark Suite
-```bash
-python experiments/run_unattended_suite.py
-```
-
----
-
-## 🧠 Theoretical Foundations & Key Papers
-1. **Van Loan Covariance Integration:** Solves continuous-to-discrete covariance evolution identically via block matrix exponentials, ensuring machine-precision Hermiticity ($\|H - H^\dagger\| = 0.00\text{e}+00$).
-2. **Phase-Space Early Warning System:** Tracks the continuous Numerical Abscissa $\omega(A_t) = \lambda_{\max}(\frac{A_t + A_t^T}{2})$. Contraction ($\omega \le 0$) guarantees structural stability; expansion ($\omega > 0$) alerts to flash liquidity collapse.
-3. **Dynamic Event-Driven SNN Gating:** Operates a surrogate-gradient Leaky Integrate-and-Fire network that keeps heavy physics dormant on 90–95% of ticks.
-4. **Magnetic Graph Laplacian:** Discovers directed cross-asset phase flux ($\Phi_{\text{BTC}\to\text{ETH}}$, $\Phi_{\text{BTC}\to\text{SOL}}$) across decentralized crypto order books.
-
+## Current policies (v3.1.2)
+- Binance builder fails closed on ANY outage > 300 s; crypto split/scaler/label-threshold support is defined by `split_plan` (no validation-only row enters scaling).
+- ω is a current-regime / latent-flow diagnostic. Stage B supervises it against a trailing-volatility flag; it is not forward-warning supervision.
+- `--gate_objective benefit` trains the gate on heavy-vs-cheap predictive benefit; `legacy` stays the default until the routing study shows benefit helps.
+- Live pipeline is gate-first (`--omega_mode gated`): ω is fresh / cached / unavailable, never silently recomputed; `always` mode makes no compute-saving claim.
